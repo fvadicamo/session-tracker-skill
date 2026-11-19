@@ -1,0 +1,15 @@
+{
+  "description": "session-tracker: SessionStart context from the stk dispatcher (clauses enabled in the node config)",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/stk hook 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

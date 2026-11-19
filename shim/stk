@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# session-tracker shim v1
+# Written by `stk shim install` (default: ~/.local/bin/stk). The plugin's bin/ is on PATH only
+# inside Claude Code's Bash tool: an ssh shell or the terminal would not find stk, and the
+# install path carries the version, so a symlink breaks at every update. This file resolves the
+# current install at every call and execs its bin/stk.
+#
+# Resolution order:
+#   1. STK_PLUGIN_ROOT, if set (an explicit pin, for a pinned checkout or a test);
+#   2. the install records of Claude Code, in
+#      ${CLAUDE_CODE_PLUGIN_CACHE_DIR:-${CLAUDE_DIR:-${CLAUDE_CONFIG_DIR:-~/.claude}}/plugins}
+#      (CLAUDE_DIR is stk's own override and wins, CLAUDE_CONFIG_DIR is the user's Claude Code
+#      home; same precedence as bin/stk):
+#      installed_plugins.json names the install path of every `session-tracker@<marketplace>`;
+#      when that marketplace was added from a local path (source `directory` or `file`) Claude
+#      reads the plugin in place from that folder and the cached copy is a stale snapshot, so
+#      the folder wins over the cached path;
+#   3. the next `stk` in PATH that is not a shim (a session started with --plugin-dir puts the
+#      plugin's bin/ on PATH without an install record). Any shim copy is skipped, not only this
+#      file: two copies in PATH with no record would otherwise exec each other forever.
+# `--stk-shim-resolve` prints the resolved bin/stk and exits 0, or exits 1 with no output.
+# STK_SHIM_SKIP_DIR=<dir> (internal, used by `stk shim install`): step 3 ignores candidates in that
+# directory, so the resolution is measured without the file about to be replaced.
+# Steps 2 and 3 need python3 (install records, real paths); step 1 does not.
+set -u
+_shim_plugins="${CLAUDE_CODE_PLUGIN_CACHE_DIR:-${CLAUDE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}/plugins}"
+_shim_realpath() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+_shim_resolve() {
+    if [[ -n "${STK_PLUGIN_ROOT:-}" ]]; then
+        [[ -x "$STK_PLUGIN_ROOT/bin/stk" ]] && { printf '%s\n' "$STK_PLUGIN_ROOT/bin/stk"; return 0; }
+        return 1
+    fi
+    local found self skip=""
+    self=$(_shim_realpath "${BASH_SOURCE[0]}")
+    [[ -n "${STK_SHIM_SKIP_DIR:-}" ]] && skip=$(_shim_realpath "$STK_SHIM_SKIP_DIR")
+    found=$(python3 - "$_shim_plugins" session-tracker <<'PY'
+import json, os, sys
+pdir, name = sys.argv[1], sys.argv[2]
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+installed = (load(os.path.join(pdir, "installed_plugins.json")) or {}).get("plugins") or {}
+known = load(os.path.join(pdir, "known_marketplaces.json")) or {}
+in_place, cached = [], []
+for pid, recs in installed.items():
+    pname, _, mkt = pid.partition("@")
+    if pname != name:
+        continue
+    for rec in recs if isinstance(recs, list) else [recs]:
+        cached.append((rec or {}).get("installPath") or "")
+    km = known.get(mkt) or {}
+    src = (km.get("source") or {}).get("source")
+    loc = km.get("installLocation") or ""
+    if src not in ("directory", "file") or not loc:
+        continue
+    # for both sources installLocation is the marketplace root (measured on 2.1.316: a `file`
+    # source records the directory that holds .claude-plugin/, not the json)
+    entries = (load(os.path.join(loc, ".claude-plugin", "marketplace.json")) or {}).get("plugins") or []
+    for e in entries:
+        if (e or {}).get("name") == name and isinstance(e.get("source"), str):
+            in_place.append(os.path.normpath(os.path.join(loc, e["source"])))
+for root in in_place + cached:
+    if root and os.access(os.path.join(root, "bin", "stk"), os.X_OK):
+        print(os.path.join(root, "bin", "stk"))
+        break
+PY
+    ) || true
+    [[ -n "$found" ]] && { printf '%s\n' "$found"; return 0; }
+    # 3. the next stk in PATH that is not a shim (this file or any other copy of it), nor in the
+    #    directory to skip
+    local cand real
+    while IFS= read -r cand; do
+        [[ -n "$cand" && -x "$cand" ]] || continue
+        real=$(_shim_realpath "$cand")
+        [[ "$real" == "$self" ]] && continue
+        [[ -n "$skip" && "$(_shim_realpath "$(dirname "$cand")")" == "$skip" ]] && continue
+        [[ "$(sed -n 2p "$real" 2>/dev/null)" == "# session-tracker shim"* ]] && continue
+        printf '%s\n' "$cand"; return 0
+    done < <(type -aP stk 2>/dev/null)
+    return 1
+}
+
+if [[ -z "${STK_PLUGIN_ROOT:-}" ]] && ! command -v python3 >/dev/null 2>&1; then
+    [[ "${1:-}" == "--stk-shim-resolve" ]] && exit 1
+    echo "stk shim: python3 is required to read the install records of Claude Code and compare paths: install it, or set STK_PLUGIN_ROOT to the plugin directory" >&2
+    exit 127
+fi
+_shim_target=$(_shim_resolve) || _shim_target=""
+if [[ "${1:-}" == "--stk-shim-resolve" ]]; then
+    [[ -n "$_shim_target" ]] || exit 1
+    printf '%s\n' "$_shim_target"; exit 0
+fi
+if [[ -z "$_shim_target" ]]; then
+    echo "stk shim: session-tracker plugin not found (no install record in $_shim_plugins, no STK_PLUGIN_ROOT, no other stk in PATH)" >&2
+    echo "stk shim: install it with 'claude plugin marketplace add fvadicamo/session-tracker-skill' (or the path of a clone) and 'claude plugin install session-tracker@session-tracker-skill', then run 'stk doctor'" >&2
+    exit 127
+fi
+exec "$_shim_target" "$@"

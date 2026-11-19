@@ -1,0 +1,13 @@
+{
+  "name": "session-tracker-skill",
+  "owner": { "name": "Francesco Vadicamo" },
+  "description": "Marketplace of the session-tracker plugin: install it straight from this repository.",
+  "plugins": [
+    {
+      "name": "session-tracker",
+      "source": "./",
+      "description": "Map, classify and navigate Claude Code sessions across nodes, with the stk dispatcher and a SessionStart hook.",
+      "category": "productivity"
+    }
+  ]
+}

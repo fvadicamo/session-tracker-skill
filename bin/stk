@@ -1,0 +1,1639 @@
+#!/usr/bin/env bash
+# stk — session-tracker: map, tree and state of the Claude Code sessions
+# across nodes. Deterministic dispatcher (no LLM): the semantic extraction and
+# the orchestration of the pass live in the `session-tracker` skill (SKILL.md).
+#
+# Usage:
+#   stk [flags] <subcommand> [args]
+#
+# Subcommands:
+#   scan  [--since <dur>] [--all]
+#                 enumerates the node's sessions -> JSONL manifest on stdout
+#                 (1 line/session: id, paths, timeline, last_uuid, forked_from,
+#                  pilot_candidates, custom_title, scan_status new|changed|unchanged).
+#                 custom_title = last /rename (custom-title), or ai-title as a fallback.
+#                 pilot_candidates = aliases after `-u|--user` of the commands listed in
+#                 pilot_commands (config); with the empty list (default) it is always [].
+#                 Default: only new|changed. --since limits by mtime (e.g. 30d,7d,24h).
+#   note  (--current | --session <id>) --kind <k> "<text>"
+#                 appends a note to the local shard + md stub. k: intent|past|present|future|placement.
+#   link  --pilot <id> --piloted <node>:<sid|?> [--label <s>] [--confidence <c>]
+#                 records (as an event) the pilot->piloted link. The materialization
+#                 of pilots[]/piloted_by[] in the records happens in the merge of the pass.
+#   sync  (pull | publish | both)
+#                 pull: local shard <- the node's slice in the canon; + read-only
+#                       mirror of the whole canon in $STK_LOCAL/canon
+#                       (global index.jsonl + all the nodes) for global queries.
+#                 publish: local shard -> canon (<canon_path>/<node>/).
+#   index         regenerates the global index.jsonl on the canon (uv+pyyaml).
+#   publish [--no-push]
+#                 end-of-block batch: sync publish + index and, only with
+#                 canon_git=auto, git commit of the sessions subtree in the repo that
+#                 contains the canon + PUSH (default: on). With canon_git=off
+#                 (the default) it stops after the index. --no-push for the local
+#                 commit only (deliberate staging). index and commit are serialized
+#                 via flock (see STK_CANON_LOCK). --push is accepted as a synonym
+#                 of the default.
+#   dashboard [--triage]
+#                 global live view of "what was left open": runs dashboard.py
+#                 on the canon (on-host with canon_mode=local, otherwise via ssh).
+#                 --triage: actionable view (triage.py helper) with the non-closed
+#                 sessions clustered as open-now/resumable/not-resumable/other-nodes
+#                 (open tab and resumability are relative to the node where you run it; use
+#                 `stk -u <node> dashboard --triage` for the live tabs of another node).
+#   where (--current|--session <id> | --cwd <p> --node <n>) [--intent <s>]
+#         [--forked-from <sid>] [--human]
+#                 deterministic placement (READ-ONLY, no network): computes the home
+#                 of the subject (ownership block > read-only prose > cluster
+#                 emerging from index.jsonl) and compares it with where-you-are (node+
+#                 folder). JSON with verdict (here|elsewhere|unknown) + candidates
+#                 with evidence/score; Claude decides whether to propose cd/ssh/branch.
+#                 See references/placement.md.
+#   repo-status <path>
+#                 one-shot git state of a local path (pure bash, no
+#                 python/uv, no fetch): branch, dirty (count), upstream,
+#                 ahead/behind. Structured JSON also on error (path-not-found
+#                 | not-a-git-repo), never die: meant to run via `-u` from a
+#                 remote node without losing stderr on the ssh channel.
+#   primary-check (--current|--session <id> | --cwd <p> --node <n>) [--human] [--force]
+#                 extends `where`: if the ownership is declared with a primary
+#                 different from the current node, compares the local state (always
+#                 live) with that of the primary via ssh (remote repo-status,
+#                 cached for STK_PRIMARY_CHECK_TTL seconds). issues[] among local-dirty
+#                 | primary-dirty | primary-ahead | primary-unreachable, with
+#                 related_sessions (from `where`) to suggest where to resume.
+#                 USES THE NETWORK (unlike where). See references/primary-check.md.
+#   close (--current|--session <id>)... [--status done|dropped|superseded|branched]
+#         [--add-tag <t>]... [--add-link <url>]... [--summary <s>] [--rationale <s>]
+#         [--name <s>] [--class task|distill] [--distill-target <skill>] [--force]
+#                 explicitly closes a session: updates the record (yaml-safe
+#                 via uv+pyyaml), sets status_source=user (protected override),
+#                 and appends a status_change event. The pre-closure analysis (leftover
+#                 open items, multiple themes, missing keywords) is on the SKILL.md side.
+#                 --session is repeatable = batch (same status/tag/link/rationale;
+#                 the per-session fields name/class/distill/summary are refused).
+#                 Refuses a session with a live tab (~/.claude/sessions); --force
+#                 to force it. Self-close (--current) is always allowed.
+#                 Guard on --name (helpers/naming.py, according to naming_policy:
+#                 error refuses, warn reports and accepts, off does not check): wip-,
+#                 characters outside the lexicon, final action outside the closed set of
+#                 references/naming.md, first token different from the subject that
+#                 naming-map.yaml assigns to the session's cwd (or equal to the
+#                 repo when the map marks it real-target). The refusal line
+#                 names the rule; --force passes the subject and action rules, never
+#                 wip- or the lexicon (and also forces the live tab).
+#   branch (--current|--session <id>) --name <trunk> --child <child> [--add-tag <t>]...
+#                 TRUNK side (before /branch): checkpoint at status=branched +
+#                 name, then prints /rename and /branch <child> to run by hand.
+#   branch --register (--current|--session <id>)
+#                 CHILD side (1st turn after /branch): reads forkedFrom from the transcript
+#                 FIELD (jq) and writes the light stub (forked_from +
+#                 name, status auto) via stub.py. No-op if it is not a branch.
+#   hygiene [--apply]
+#                 lists (dry-run) the empty stubs in the local shard (orphan
+#                 records without information); --apply removes them. Local shard
+#                 only; the canon (git) is cleaned up with git rm + publish.
+#   hook          SessionStart entry: reads the JSON payload on stdin and (at
+#                 source startup|resume|clear, with no intent already recorded)
+#                 emits additionalContext with the clauses turned on in config:
+#                 hook_ask_intent asks to record the intent; naming_policy
+#                 != off proposes the name with the context resolved from the payload's cwd
+#                 (helpers/naming.py context: the contexts, kb_orgs or
+#                 kb_tiers row and its comment, the subject, the set of actions);
+#                 hook_tmux_tab asks, if the tmux window was never named or is
+#                 <prefix>-<number>, to rename it <prefix>-<issue|slug>,
+#                 otherwise to leave it; hook_placement and hook_primary_check;
+#                 at the end the text of hook_extra_context_file. At resume/clear
+#                 it always adds the clause to register a branch. Without
+#                 clauses it emits nothing.
+#   init  [--node <slug>] [--canon-mode local|ssh] [--canon-host <h>] [--canon-path <p>]
+#         [--canon-git auto|off] [--naming-policy off|warn|error] [--force]
+#                 writes the config file: the keys passed are active, the others commented
+#                 out with their default and a line saying what they are for (how to change or
+#                 turn off naming included). Refuses to overwrite without --force.
+#   doctor [--remote]
+#                 says what is configured and what is not (helpers/doctor.py): file read,
+#                 unknown or misspelled keys (silently ignored by everything
+#                 else), out-of-domain values, relative paths, naming_map declared but
+#                 missing or malformed, unreadable overlay, installed plugin and hook
+#                 (from the plugin, or in settings.json; both = double injection), shim
+#                 (`stk` in PATH: the shim, a symlink, the plugin's bin/ alone or
+#                 another program), tools. Exit 1 if there is at least one error. No
+#                 network, except --remote: via ssh, for each alias in remote_aliases and each
+#                 slug in known_nodes other than this node (the targets of -u and of the
+#                 primary-check), `command -v stk` and line 2 of the file found: a
+#                 session-tracker bin/stk, the shim (and what it resolves), or another program
+#                 (BatchMode, 5 s to connect, 30 s per host).
+#   shim (install [--dest <path>] [--force] | resolve)
+#                 install: writes to <path> (default ~/.local/bin/stk) the shim that on
+#                 every call resolves the current plugin installation (shim/stk:
+#                 STK_PLUGIN_ROOT, then Claude Code's records, then the next stk in
+#                 PATH) and runs its bin/stk. It replaces its own shim or a
+#                 symlink to a session-tracker bin/stk; another file, or a working symlink
+#                 when here the shim would resolve nothing, only with
+#                 --force. Needed on every node that is a target of -u or the primary of a repo: the
+#                 plugin's bin/ is in the PATH of Claude's shell alone, not of ssh or
+#                 of the terminal, and the shim's folder must be in the PATH of the
+#                 NON-interactive ssh shell (on macOS ~/.local/bin is often missing).
+#                 resolve: prints the bin/stk that the shim would resolve here (exit 1 if none).
+#
+# Global flags (before the subcommand):
+#   -u, --user <ssh-alias>   runs the subcommand on a remote node via ssh
+#                            (default: local). Allowlist: scan close note publish
+#                            dashboard repo-status. Open tab/resumability/shard
+#                            are local to the remote node: they run there (argument
+#                            quoting via %q). primary-check is deliberately
+#                            excluded (it would use -u to check the primary OF
+#                            ANOTHER remote node: a pointless double hop).
+#   -h, --help
+#
+# Config: ${XDG_CONFIG_HOME:-~/.config}/session-tracker/config, `key=value` lines,
+# comments with `#`, optional quotes around the value. Precedence: environment
+# variable (STK_*) > file > default. The defaults are neutral: local store under
+# data_dir, no remote host, empty lists. helpers/config.py reads the same
+# file: the two implementations must be kept aligned.
+#
+#   key             env                  default
+#   data_dir        STK_LOCAL            ~/.local/session-tracker  (staging + mirror)
+#   canon_mode      STK_CANON_MODE       local   (local|ssh: ONLY this decides whether the
+#                                        canon is on-host or reached via ssh)
+#   node            STK_NODE             file <data_dir>/node, then lowercase short hostname
+#   canon_host      STK_CANON_HOST       (empty; required with canon_mode=ssh)
+#   canon_path      STK_CANON_PATH       <data_dir>/store with canon_mode=local;
+#                                        required with canon_mode=ssh (it is a path
+#                                        on the host, it is not derived from the local one)
+#   canon_git       STK_CANON_GIT        off     (off: `publish` never touches git;
+#                                        auto: commits and pushes if the canon is in
+#                                        a git repo, ANY repo that contains it: with the
+#                                        default store inside a home under git the
+#                                        records would end up in the remote of that home)
+#   known_nodes     STK_KNOWN_NODES      (empty) slugs of the known nodes, for `where`
+#   remote_aliases  STK_REMOTE_ALIASES   (empty) ssh aliases allowed as pilot (merge)
+#   pilot_commands  STK_PILOT_COMMANDS   (empty) remote piloting commands whose `-u <alias>`
+#                                        scan reads as a pilot candidate (empty = none)
+#   naming_policy   STK_NAMING_POLICY    warn    (off: the hook does not propose names and `close
+#                                        --name` does not check; warn: the hook proposes the name
+#                                        and `close` reports an out-of-rule name but accepts
+#                                        it, except wip- and characters outside the lexicon,
+#                                        refused anyway, --force included; error: `close`
+#                                        refuses it, --force passes except those two)
+#   naming_map      STK_NAMING_MAP       <data_dir>/naming-map.yaml (where `sync pull` copies
+#                                        the canon's map; hook, close, where read it)
+#   hook_ask_intent STK_HOOK_ASK_INTENT  off     clauses of the SessionStart hook, on|off:
+#   hook_placement  STK_HOOK_PLACEMENT   off       ask for the intent; `stk where --current`;
+#   hook_primary_check STK_HOOK_PRIMARY_CHECK off  `stk primary-check`; name of the tmux
+#   hook_tmux_tab   STK_HOOK_TMUX_TAB    off       window (requires naming_policy != off).
+#                                        A value outside on|off counts as off, and hook.log says so
+#   hook_extra_context_file STK_HOOK_EXTRA_CONTEXT_FILE (empty) file whose text the hook
+#                                        appends to its own context (private overlay)
+#
+# The `#` opens a comment only at the start of a line: at the end of a value it is part of it. A leading `~/`
+# expands only in local paths (data_dir, naming_map, hook_extra_context_file;
+# canon_path with canon_mode=local), and those paths are ONLY absolute or with `~/`: a relative one
+# is a config error (doctor reports it; sync, index, publish, dashboard and every shard
+# writer, close, note, link, branch, hygiene, and primary-check refuse it; the hook says so
+# in the context and logs it, and neither reads nor writes a relative path). A declared naming_map
+# (file or env) must exist: if it is missing,
+# the close guard does not run (exit 2) and the hook says so; the missing default means "no map".
+#
+# Other env (override only):
+#   STK_NODE        see `node` above. WARNING: deriving it from the hostname is unreliable
+#                   (the machine name is not the slug): set `node` in the config (`stk init --node`).
+#   STK_CANON_LOCK  lockfile to serialize concurrent index/publish from several
+#                   sessions. Default: $STK_CANON_PATH/.stk.lock (on the canon)
+#   STK_PRIMARY_CHECK_TTL  seconds of validity of the cache of the remote side of
+#                   `primary-check` (the local side is never cached). Default: 1800.
+#   CLAUDE_DIR      Claude Code's home (sessions, projects, settings.json, plugin records).
+#                   Default: CLAUDE_CONFIG_DIR, the variable with which the USER moves that home
+#                   and which Claude passes to hooks and Bash (not with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1),
+#                   otherwise ~/.claude. Exported to the helpers (triage.py reads the same folders).
+set -euo pipefail
+
+# ---- config -----------------------------------------------------------------
+STK_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/session-tracker/config"
+# STK_* already in the environment BEFORE the resolution: below all the resolved keys are exported,
+# and doctor must be able to tell what really comes from the environment apart from the file and the defaults.
+STK_ENV_KEYS=$(env | sed -n 's/^\(STK_[A-Za-z0-9_]*\)=.*/\1/p' | tr '\n' ' ')
+# _cfg_get <key>: value of the key in the config file (last occurrence wins,
+# like the dict of helpers/config.py), empty if the file or the key is missing. The file
+# is read, not `source`d: a line is not code.
+_cfg_get() {
+    local key="$1" line k v out=""
+    [[ -f "$STK_CONFIG_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # trim an explicit ASCII set, never [:space:]: macOS libc counts U+00A0 as a space and glibc
+        # does not, and config.py (WS) must read the same value on both
+        local ws=$' \t\r'
+        line="${line#"${line%%[!$ws]*}"}"
+        [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+        k="${line%%=*}"; k="${k%"${k##*[!$ws]}"}"
+        [[ "$k" == "$key" ]] || continue
+        v="${line#*=}"; v="${v#"${v%%[!$ws]*}"}"; v="${v%"${v##*[!$ws]}"}"
+        if [[ ${#v} -ge 2 && ( "$v" == \"*\" || "$v" == \'*\' ) ]]; then v="${v:1:${#v}-2}"; fi
+        out="$v"
+    done < "$STK_CONFIG_FILE"
+    printf '%s' "$out"
+}
+# _cfg_resolve <VAR> <key> <default>: env > file > default, into the variable VAR.
+_cfg_resolve() {
+    local var="$1" key="$2" def="$3" val
+    val="${!var:-}"
+    [[ -n "$val" ]] || val=$(_cfg_get "$key")
+    [[ -n "$val" ]] || val="$def"
+    printf -v "$var" '%s' "$val"
+}
+_cfg_resolve STK_LOCAL           data_dir        "$HOME/.local/session-tracker"
+_cfg_resolve STK_NODE            node            ""
+_cfg_resolve STK_CANON_MODE      canon_mode      local
+_cfg_resolve STK_CANON_HOST      canon_host      ""
+_cfg_resolve STK_CANON_PATH      canon_path      ""
+# the default store only applies on-host: with ssh the path belongs to the host and must be declared
+[[ -n "$STK_CANON_PATH" || "$STK_CANON_MODE" != local ]] || STK_CANON_PATH="$STK_LOCAL/store"
+_cfg_resolve STK_CANON_GIT       canon_git       off
+_cfg_resolve STK_KNOWN_NODES     known_nodes     ""
+_cfg_resolve STK_REMOTE_ALIASES  remote_aliases  ""
+_cfg_resolve STK_PILOT_COMMANDS  pilot_commands  ""
+_cfg_resolve STK_NAMING_POLICY   naming_policy   warn
+_cfg_resolve STK_NAMING_MAP      naming_map      ""
+# declared (file or env) or default: if declared, the file must exist (naming.py --require-map)
+STK_NAMING_MAP_DECLARED="${STK_NAMING_MAP:+1}"
+_cfg_resolve STK_HOOK_ASK_INTENT    hook_ask_intent    off
+_cfg_resolve STK_HOOK_PLACEMENT     hook_placement     off
+_cfg_resolve STK_HOOK_PRIMARY_CHECK hook_primary_check off
+_cfg_resolve STK_HOOK_TMUX_TAB      hook_tmux_tab      off
+_cfg_resolve STK_HOOK_EXTRA_CONTEXT_FILE hook_extra_context_file ""
+# `~/` expands only in LOCAL paths (data_dir, naming_map, hook_extra_context_file, and
+# canon_path with canon_mode=local): with ssh canon_path belongs to the host, and `~` is expanded by the
+# remote shell with the right home.
+[[ "$STK_LOCAL" == "~/"* ]] && STK_LOCAL="$HOME/${STK_LOCAL#\~/}"
+[[ "$STK_CANON_MODE" == local && "$STK_CANON_PATH" == "~/"* ]] && STK_CANON_PATH="$HOME/${STK_CANON_PATH#\~/}"
+[[ "$STK_NAMING_MAP" == "~/"* ]] && STK_NAMING_MAP="$HOME/${STK_NAMING_MAP#\~/}"
+[[ "$STK_HOOK_EXTRA_CONTEXT_FILE" == "~/"* ]] && STK_HOOK_EXTRA_CONTEXT_FILE="$HOME/${STK_HOOK_EXTRA_CONTEXT_FILE#\~/}"
+# the map lives where `sync pull` copies it from the canon, next to the mirror
+[[ -n "$STK_NAMING_MAP" ]] || STK_NAMING_MAP="$STK_LOCAL/naming-map.yaml"
+export STK_LOCAL STK_NODE STK_CANON_MODE STK_CANON_HOST STK_CANON_PATH STK_CANON_GIT STK_KNOWN_NODES STK_REMOTE_ALIASES STK_PILOT_COMMANDS
+export STK_NAMING_POLICY STK_NAMING_MAP STK_NAMING_MAP_DECLARED STK_HOOK_ASK_INTENT STK_HOOK_PLACEMENT STK_HOOK_PRIMARY_CHECK STK_HOOK_TMUX_TAB STK_HOOK_EXTRA_CONTEXT_FILE
+# CLAUDE_CONFIG_DIR moves settings, sessions and plugin records together: scan, the open-tab guard,
+# doctor and the shim must read the same home. CLAUDE_DIR is stk's override and wins;
+# the same precedence (CLAUDE_DIR, then CLAUDE_CONFIG_DIR, then ~/.claude) is in shim/stk, and
+# the export carries it to the helpers (triage.py).
+CLAUDE_DIR="${CLAUDE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+export CLAUDE_DIR
+# plugin records (installed_plugins.json, known_marketplaces.json): same resolution as shim/stk
+PLUGINS_DIR="${CLAUDE_CODE_PLUGIN_CACHE_DIR:-$CLAUDE_DIR/plugins}"
+SHARD="$STK_LOCAL/shard"   # mirror of the canon for THIS node (= sessions/<node>/)
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'; exit "${1:-0}"; }
+die()   { echo "stk: $*" >&2; exit 1; }
+require_arg() { [[ -n "${1:-}" ]] || die "'$2' requires an argument"; }
+# Validates the canon's config; only the subcommands that touch it call it
+# (sync, index, publish, dashboard), so a broken config does not block note or close.
+# Config paths: only absolute or with ~/ (already expanded above). A relative one would
+# resolve against the current folder of whoever invokes stk: sync pull would drop the
+# map in the repo one is working in, hook and close would look for it elsewhere at every session.
+# _paths_errors prints one message per line (empty if all is well); _paths_check dies on the
+# first. Same rule as path_errors() in helpers/config.py: keep them in step.
+_paths_errors() {
+    local pair key var v
+    for pair in data_dir:STK_LOCAL canon_path:STK_CANON_PATH naming_map:STK_NAMING_MAP hook_extra_context_file:STK_HOOK_EXTRA_CONTEXT_FILE; do
+        key="${pair%%:*}"; var="${pair#*:}"; v="${!var}"
+        [[ "$key" == canon_path && "$STK_CANON_MODE" != local ]] && continue
+        [[ -z "$v" || "$v" == /* ]] && continue
+        printf '%s=%s relative: config paths are absolute or start with ~/ (file %s or %s)\n' "$key" "$v" "$STK_CONFIG_FILE" "$var"
+    done
+}
+_paths_check() { local e; e=$(_paths_errors | head -1); [[ -z "$e" ]] || die "$e"; }
+# _lock_path: the flock file of index/publish (STK_CANON_LOCK, environment only). In local
+# mode it must be absolute, like every path of the config: a relative one would land in the
+# current folder. With ssh the path is the host's and its shell resolves it.
+_lock_path() {
+    local lock="${STK_CANON_LOCK:-$STK_CANON_PATH/.stk.lock}"
+    [[ "$STK_CANON_MODE" != local || "$lock" == /* ]] || die "STK_CANON_LOCK=$lock relative: the lock path is absolute only (it would be created in the current folder)"
+    printf '%s' "$lock"
+}
+_canon_check() {
+    _paths_check
+    case "$STK_CANON_MODE" in
+        local) ;;
+        ssh) [[ -n "$STK_CANON_HOST" ]] || die "canon_mode=ssh requires canon_host (file $STK_CONFIG_FILE or STK_CANON_HOST)"
+             [[ -n "$STK_CANON_PATH" ]] || die "canon_mode=ssh requires canon_path, the path on the host (file $STK_CONFIG_FILE or STK_CANON_PATH)";;
+        *) die "invalid canon_mode '$STK_CANON_MODE' (local|ssh)";;
+    esac
+    [[ "$STK_CANON_GIT" =~ ^(auto|off)$ ]] || die "invalid canon_git '$STK_CANON_GIT' (auto|off)"
+}
+# Validates naming_policy; `close` calls it (a typo must not become a silent pass).
+# The hook does not die: it logs and uses the default (cmd_hook, variable policy).
+_naming_policy_check() {
+    [[ "$STK_NAMING_POLICY" =~ ^(off|warn|error)$ ]] || die "invalid naming_policy '$STK_NAMING_POLICY' (off|warn|error, file $STK_CONFIG_FILE or STK_NAMING_POLICY)"
+}
+
+resolve_node() {
+    if [[ -n "${STK_NODE:-}" ]]; then echo "$STK_NODE"; return; fi
+    if [[ -f "$STK_LOCAL/node" ]]; then tr -d '[:space:]' < "$STK_LOCAL/node"; return; fi
+    hostname -s 2>/dev/null | tr 'A-Z' 'a-z'
+}
+
+# Identifies the Claude Code session in which THIS stk is running (for
+# --current). Strategy:
+#   1) env var $CLAUDE_CODE_SESSION_ID (exposed by Claude Code, authoritative);
+#   2) walk of the PID chain from my $$ upward, matching the .pid field
+#      of the ~/.claude/sessions/*.json files. The process ancestry is intrinsic:
+#      it holds even with N parallel sessions from the same folder.
+# NO fallback to "most recent file" (wrong in multi-session scenarios).
+_resolve_current_sid() {
+    if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+        echo "$CLAUDE_CODE_SESSION_ID"; return 0
+    fi
+    local p=$$ pp
+    while [[ -n "$p" && "$p" != "1" ]]; do
+        for s in "$CLAUDE_DIR"/sessions/*.json; do
+            [[ -f "$s" ]] || continue
+            if [[ "$(jq -r '.pid // empty' "$s" 2>/dev/null)" == "$p" ]]; then
+                jq -r '.sessionId // empty' "$s"; return 0
+            fi
+        done
+        pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        [[ -z "$pp" || "$pp" == "$p" ]] && break
+        p="$pp"
+    done
+    return 1
+}
+
+# Resolves (encoded, cwd) of a sid even if the JSONL was pruned. Sets the globals
+# RESOLVED_ENCODED / RESOLVED_CWD. Order: live JSONL -> record in the shard -> record in the
+# canon mirror -> _unindexed (avoids dupes/orphans on old sessions).
+_resolve_encoded() {
+    local sid="$1" f rec
+    RESOLVED_ENCODED="_unindexed"; RESOLVED_CWD=""
+    f=$(ls "$CLAUDE_DIR"/projects/*/"$sid".jsonl 2>/dev/null | head -1) || true
+    if [[ -n "$f" ]]; then
+        RESOLVED_ENCODED=$(basename "$(dirname "$f")")
+        RESOLVED_CWD=$(jq -rn 'reduce inputs as $e (null; if $e.cwd!=null then $e.cwd else . end)' "$f" 2>/dev/null)
+        return 0
+    fi
+    rec=$(ls "$SHARD"/*/"$sid".md 2>/dev/null | grep -v '/_unindexed/' | head -1) || true
+    [[ -z "$rec" ]] && rec=$(ls "$STK_LOCAL"/canon/*/*/"$sid".md 2>/dev/null | grep -v '/_unindexed/' | head -1) || true
+    if [[ -n "$rec" ]]; then
+        RESOLVED_ENCODED=$(basename "$(dirname "$rec")")
+        RESOLVED_CWD=$(sed -n 's/^project_path:[[:space:]]*//p' "$rec" | head -1)
+    fi
+    return 0
+}
+
+# If the sid is a session OPEN now (live pid from ~/.claude/sessions) prints the pid.
+_sid_open_pid() {
+    local sid="$1" s pid
+    for s in "$CLAUDE_DIR"/sessions/*.json; do
+        [[ -f "$s" ]] || continue
+        if [[ "$(jq -r '.sessionId // empty' "$s" 2>/dev/null)" == "$sid" ]]; then
+            pid=$(jq -r '.pid // empty' "$s" 2>/dev/null)
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && { echo "$pid"; return 0; }
+        fi
+    done
+    return 1
+}
+
+# epoch mtime of a file, portable BSD (mac) / GNU (linux). NB: tell them apart
+# via $OSTYPE: on Linux "stat -f" reads -f as filesystem-status and
+# prints garbage on stdout before failing, contaminating the fallback.
+case "$OSTYPE" in
+    darwin*) file_mtime() { stat -f %m "$1"; } ;;
+    *)       file_mtime() { stat -c %Y "$1"; } ;;
+esac
+now_epoch()  { date +%s; }
+iso_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# duration like 30d/12h/45m/3600(s) -> seconds
+dur_to_secs() {
+    local d="$1" n unit
+    [[ "$d" =~ ^([0-9]+)([dhms]?)$ ]] || die "invalid duration: $d"
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]:-s}"
+    case "$unit" in d) echo $((n*86400));; h) echo $((n*3600));; m) echo $((n*60));; *) echo "$n";; esac
+}
+
+# reads a scalar field from the YAML frontmatter of an md ("key: value" line)
+fm_get() { # fm_get <file> <key>
+    [[ -f "$1" ]] || return 0
+    awk -v k="$2" '
+        BEGIN{infm=0}
+        /^---[[:space:]]*$/{infm++; next}
+        infm==1 && $0 ~ "^"k":" { sub("^"k":[[:space:]]*",""); gsub(/[[:space:]]+$/,""); print; exit }
+    ' "$1"
+}
+
+# ---- subcommand: scan -------------------------------------------------------
+cmd_scan() {
+    local since_secs="" only_changed=1 cutoff=0
+    while [[ "${1:-}" =~ ^- ]]; do
+        case "$1" in
+            --since) require_arg "${2:-}" --since; since_secs=$(dur_to_secs "$2"); shift 2;;
+            --all)   only_changed=0; shift;;
+            *) die "scan: unknown flag '$1'";;
+        esac
+    done
+    [[ -n "$since_secs" ]] && cutoff=$(( $(now_epoch) - since_secs ))
+    _paths_check   # with a relative data_dir the shard would be read from the current folder
+    local node; node=$(resolve_node)
+    # pilot-link candidates: alias after `-u|--user` of the remote piloting commands listed in
+    # pilot_commands (the flag comes before the subcommand, so the alias is right after -u). Empty
+    # list, the default: no candidate, and the regex stays empty.
+    # `read -ra` and not a `for` over the expansion: a `*` in the list must not become the files of the
+    # current folder; comma and whitespace separators, like split_list in config.py. Lexicon in
+    # LC_ALL=C, like doctor.py. The command name cannot be the tail of a word (`tmux` does not
+    # take `xtmux -u`), but it can follow a path (`/bin/tmux`) or a newline or tab encoded in the
+    # JSONL (`\n`, `\t`: a line of a multi-line command).
+    local pilot_re="" pcmd alt=""
+    local -a pcmds=(); IFS=$', \t' read -ra pcmds <<<"$STK_PILOT_COMMANDS"
+    for pcmd in ${pcmds[@]+"${pcmds[@]}"}; do
+        [[ -n "$pcmd" ]] || continue
+        printf '%s' "$pcmd" | LC_ALL=C grep -qE '^[A-Za-z0-9_.-]+$' || die "scan: pilot_commands contains an invalid name '$pcmd' (only [A-Za-z0-9_.-])"
+        alt+="${alt:+|}${pcmd//./\\.}"
+    done
+    [[ -z "$alt" ]] || pilot_re="(^|[^A-Za-z0-9_-]|\\\\[nrt])($alt)[[:space:]]+(-u|--user)[[:space:]]+[A-Za-z0-9_.-]+"
+
+    shopt -s nullglob
+    local f
+    for f in "$CLAUDE_DIR"/projects/*/*.jsonl; do
+        local mtime; mtime=$(file_mtime "$f")
+        [[ "$mtime" -ge "$cutoff" ]] || continue
+        local sid encoded base pilots stored last_uuid status
+        sid=$(basename "$f" .jsonl)
+        encoded=$(basename "$(dirname "$f")")
+
+        base=$(jq -rn --arg sid "$sid" '
+            reduce inputs as $e (
+              {first:null,last:null,cwd:null,branch:null,forked:null,uuid:null,n:0,ctitle:null,atitle:null};
+              .n += 1
+              | (if ($e.timestamp != null) then (.first = (.first // $e.timestamp) | .last = $e.timestamp) else . end)
+              | (if ($e.cwd != null) then .cwd = $e.cwd else . end)
+              | (if ($e.gitBranch != null) then .branch = $e.gitBranch else . end)
+              | (if ($e.forkedFrom != null) then .forked = ($e.forkedFrom.sessionId // null) else . end)
+              | (if ($e.uuid != null) then .uuid = $e.uuid else . end)
+              | (if ($e.type == "custom-title" and $e.customTitle != null) then .ctitle = $e.customTitle else . end)
+              | (if ($e.type == "ai-title" and $e.aiTitle != null) then .atitle = $e.aiTitle else . end)
+            )
+            | {session_id:$sid, started_at:.first, last_activity_at:.last, cwd:.cwd,
+               git_branch:.branch, forked_from:.forked, last_uuid:.uuid, n_events:.n,
+               custom_title:(.ctitle // .atitle)}
+        ' "$f" 2>/dev/null) || continue
+        [[ -n "$base" ]] || continue
+
+        last_uuid=$(jq -r '.last_uuid // ""' <<<"$base")
+        pilots="[]"
+        if [[ -n "$pilot_re" ]]; then
+            pilots=$(grep -hoE "$pilot_re" "$f" 2>/dev/null \
+                | awk '{print $NF}' | sort -u | jq -R . | jq -sc . ) || pilots="[]"
+            pilots=${pilots:-[]}
+        fi
+
+        stored=$(fm_get "$SHARD/$encoded/$sid.md" last_indexed_uuid)
+        if [[ ! -f "$SHARD/$encoded/$sid.md" ]]; then status=new
+        elif [[ "$stored" != "$last_uuid" ]]; then status=changed
+        else status=unchanged; fi
+        [[ "$only_changed" -eq 1 && "$status" == unchanged ]] && continue
+
+        jq -c \
+            --arg node "$node" --arg ep "$encoded" --argjson mtime "$mtime" \
+            --argjson pilots "$pilots" --arg status "$status" '
+            . + {node:$node, encoded_project:$ep,
+                 project_path:(.cwd),
+                 project:((.cwd // "") | split("/") | last),
+                 mtime:$mtime, pilot_candidates:$pilots, scan_status:$status}
+        ' <<<"$base"
+    done
+}
+
+# ---- subcommand: note -------------------------------------------------------
+cmd_note() {
+    _paths_check   # a relative path in config stops every writer before it writes
+    local sid="" kind="" text=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --current) sid=$(_resolve_current_sid) || die "note: cannot identify the current session (no \$CLAUDE_CODE_SESSION_ID and no PID match in ~/.claude/sessions); use --session <id>"; shift;;
+            --session) require_arg "${2:-}" --session; sid="$2"; shift 2;;
+            --kind)    require_arg "${2:-}" --kind; kind="$2"; shift 2;;
+            -*) die "note: unknown flag '$1'";;
+            *)  text="$1"; shift;;
+        esac
+    done
+    [[ -n "$kind" ]] || die "note: --kind required (intent|past|present|future|placement)"
+    [[ "$kind" =~ ^(intent|past|present|future|placement)$ ]] || die "note: invalid kind '$kind'"
+    [[ -n "$text" ]] || die "note: note text missing"
+    [[ -n "$sid" ]] || die "note: no session specified (use --current or --session <id>)"
+
+    local node; node=$(resolve_node)
+    local encoded cwd
+    _resolve_encoded "$sid"; encoded="$RESOLVED_ENCODED"; cwd="$RESOLVED_CWD"
+    local id ts day
+    id=$(uuidgen 2>/dev/null || echo "$(date +%s)-$RANDOM")
+    ts=$(iso_now); day=$(date -u +%Y-%m-%d)
+
+    mkdir -p "$SHARD/$encoded"
+    jq -nc --arg ts "$ts" --arg id "$id" --arg node "$node" --arg sid "$sid" \
+           --arg kind "$kind" --arg text "$text" \
+       '{ts:$ts,id:$id,node:$node,event:"note",session_id:$sid,kind:$kind,text:$text}' \
+       >> "$SHARD/events.jsonl"
+
+    local md="$SHARD/$encoded/$sid.md"
+    if [[ ! -f "$md" ]]; then
+        {
+          echo "---"
+          echo "schema: v0"
+          echo "session_id: $sid"
+          echo "node: $node"
+          echo "project: $(jq -nr --arg v "$(basename "${cwd:-unknown}")" '$v|@json')"   # JSON strings are valid YAML scalars: a `: ` or a quote in the path stays data
+          echo "project_path: $(jq -nr --arg v "${cwd}" '$v|@json')"
+          echo "status: unknown"
+          echo "status_source: auto"
+          echo "---"
+          echo "## extracted"
+          echo ""
+          echo "## user_notes"
+        } > "$md"
+    fi
+    printf -- '- %s (%s): %s  <!-- nid:%s -->\n' "$day" "$kind" "$text" "$id" >> "$md"
+    echo "[stk] note ($kind) recorded on $node:$sid"
+}
+
+# ---- subcommand: link -------------------------------------------------------
+cmd_link() {
+    _paths_check   # no write with a relative path in config
+    local pilot="" piloted="" label="" conf="low"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pilot)      require_arg "${2:-}" --pilot; pilot="$2"; shift 2;;
+            --piloted)    require_arg "${2:-}" --piloted; piloted="$2"; shift 2;;
+            --label)      require_arg "${2:-}" --label; label="$2"; shift 2;;
+            --confidence) require_arg "${2:-}" --confidence; conf="$2"; shift 2;;
+            *) die "link: unknown flag '$1'";;
+        esac
+    done
+    [[ -n "$pilot" && -n "$piloted" ]] || die "link: --pilot and --piloted required"
+    [[ "$conf" =~ ^(low|medium|high)$ ]] || die "link: invalid confidence '$conf'"
+    local pnode psid node ts
+    pnode="${piloted%%:*}"; psid="${piloted#*:}"
+    [[ "$psid" == "?" ]] && psid=""
+    node=$(resolve_node); ts=$(iso_now)
+    mkdir -p "$SHARD"
+    jq -nc --arg ts "$ts" --arg node "$node" --arg pid "$pilot" \
+           --arg pnode "$pnode" --arg psid "$psid" --arg label "$label" --arg conf "$conf" '
+        {ts:$ts, node:$node, event:"link", rel:"pilots",
+         pilot:{node:$node, session_id:$pid},
+         piloted:{node:$pnode, session_id:(if $psid=="" then null else $psid end)},
+         by:"user", confidence:$conf}
+        + (if $label=="" then {} else {label:$label} end)
+    ' >> "$SHARD/events.jsonl"
+    echo "[stk] link $node:$pilot -> $pnode:${psid:-?} (confidence=$conf)"
+}
+
+# ---- subcommand: sync -------------------------------------------------------
+# With canon_mode=local the canon is on-host: local rsync instead of
+# ssh-loopback. The local SHARD stays separate from the canon for symmetry with
+# the other nodes. With canon_mode=ssh the canon is $STK_CANON_HOST:$STK_CANON_PATH.
+# The SHARD pull uses rsync -au (--update): the shard is per-node and SHARED
+# among concurrent sessions, and -au protects the more recent local changes
+# not yet published (close/note/branch) from the clobber of the older canon.
+# (The read-only mirror $STK_LOCAL/canon stays -a --delete: it is a full copy,
+# nobody edits it locally.)
+# _rq <value>: quotes a value for the shell on the canon host (every piece of canon_path, the
+# lock and the commit message that goes into an ssh command string): a path with a space or
+# a `;` must reach the host as one word and never as a second command. A leading `~/` stays
+# bare, because it is the HOST's home that expands it.
+_rq() { if [[ "$1" == "~/"* ]]; then printf '~/%s' "$(printf %q "${1#"~/"}")"; else printf %q "$1"; fi; }
+# _rsync_or_die <what> <rsync args...>: a transfer that fails is an error, partial transfer
+# (exit 23/24) included; stderr stays visible because it says which failure it was.
+_rsync_or_die() { local what="$1"; shift; local rc=0; "$@" || rc=$?; [[ $rc -eq 0 ]] || die "$what failed (rsync exit $rc)"; }
+# _canon_probe <path>: 0 = the path exists on the host, 1 = it does not (first round), 3 = an
+# ancestor exists but cannot be traversed (a permission problem, not a first round), other =
+# the host is unreachable; the caller decides. `test -e` alone says 1 in both of the first two
+# cases, so the nearest existing ancestor is checked for the search bit. POSIX sh on the host.
+# ssh in BatchMode so that a missing key fails instead of asking.
+_canon_probe() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$STK_CANON_HOST" "p=$(_rq "$1"); [ -e \"\$p\" ] && exit 0; d=\$(dirname \"\$p\"); while [ \"\$d\" != / ] && [ \"\$d\" != . ]; do if [ -e \"\$d\" ]; then [ -x \"\$d\" ] && exit 1 || exit 3; fi; d=\$(dirname \"\$d\"); done; exit 1"; }
+
+cmd_sync() {
+    local mode="${1:-both}"
+    local node; node=$(resolve_node)
+    _canon_check   # before the mkdir: with a relative path nothing must be created in the cwd
+    mkdir -p "$SHARD"
+    if [[ "$STK_CANON_MODE" == local ]]; then
+        local canon="$STK_CANON_PATH/$node/"
+        mkdir -p "$canon"
+        case "$mode" in
+            pull)    _rsync_or_die "pull: the node's slice" rsync -au "$canon" "$SHARD/"
+                     mkdir -p "$STK_LOCAL/canon"
+                     _rsync_or_die "pull: the mirror of the canon" rsync -a --delete --exclude='.git' "$STK_CANON_PATH/" "$STK_LOCAL/canon/"
+                     if [[ -f "$STK_CANON_PATH/naming-map.yaml" ]]; then
+                         mkdir -p "$(dirname "$STK_NAMING_MAP")"; cp -f "$STK_CANON_PATH/naming-map.yaml" "$STK_NAMING_MAP" || die "pull: cannot copy naming-map.yaml to $STK_NAMING_MAP"
+                     fi;;
+            publish) rsync -a "$SHARD/" "$canon"; echo "[stk] publish -> $canon (local)";;
+            both)    cmd_sync pull; cmd_sync publish;;
+            *) die "sync: invalid mode '$mode' (pull|publish|both)";;
+        esac
+        return
+    fi
+    local remote="$STK_CANON_HOST:$STK_CANON_PATH/$node/"
+    case "$mode" in
+        pull)    # the first round is the only failure that is not one: the canon, or the node's
+                 # slice, does not exist on the host yet. Anything else (host unreachable, partial
+                 # transfer) is an error and `sync both` must not publish after it.
+                 local probe=0
+                 _canon_probe "$STK_CANON_PATH" || probe=$?
+                 case "$probe" in
+                     0) ;;
+                     1) echo "[stk] pull: no canon at $STK_CANON_HOST:$STK_CANON_PATH yet (first round, nothing to pull)"; return 0;;
+                     3) die "pull: $STK_CANON_PATH on $STK_CANON_HOST sits under a folder this account cannot traverse (not a first round: fix the permissions on the host)";;
+                     *) die "pull: $STK_CANON_HOST unreachable (ssh exit $probe)";;
+                 esac
+                 probe=0; _canon_probe "$STK_CANON_PATH/$node" || probe=$?
+                 case "$probe" in
+                     0) _rsync_or_die "pull: the node's slice" rsync -au "$remote" "$SHARD/";;
+                     1) echo "[stk] pull: no slice for $node on the canon yet (first round for this node)";;
+                     3) die "pull: $STK_CANON_PATH/$node on $STK_CANON_HOST sits under a folder this account cannot traverse";;
+                     *) die "pull: $STK_CANON_HOST unreachable (ssh exit $probe)";;
+                 esac
+                 mkdir -p "$STK_LOCAL/canon"
+                 _rsync_or_die "pull: the mirror of the canon" rsync -a --delete --exclude='.git' "$STK_CANON_HOST:$STK_CANON_PATH/" "$STK_LOCAL/canon/"
+                 mkdir -p "$(dirname "$STK_NAMING_MAP")"
+                 # the map is optional on the canon: a missing one is not an error, a failed transfer is
+                 probe=0; _canon_probe "$STK_CANON_PATH/naming-map.yaml" || probe=$?
+                 case "$probe" in
+                     0) _rsync_or_die "pull: naming-map.yaml" rsync -a "$STK_CANON_HOST:$STK_CANON_PATH/naming-map.yaml" "$STK_NAMING_MAP";;
+                     1) ;;
+                     3) die "pull: naming-map.yaml on $STK_CANON_HOST sits under a folder this account cannot traverse";;
+                     *) die "pull: $STK_CANON_HOST unreachable (ssh exit $probe)";;
+                 esac;;
+        publish) ssh "$STK_CANON_HOST" "mkdir -p $(_rq "$STK_CANON_PATH/$node")"; rsync -a "$SHARD/" "$remote"; echo "[stk] publish -> $remote";;
+        both)    cmd_sync pull; cmd_sync publish;;
+        *) die "sync: invalid mode '$mode' (pull|publish|both)";;
+    esac
+}
+
+# ---- subcommand: index ------------------------------------------------------
+# Regenerates the machine-first global index on the canon. Runs on-host with
+# canon_mode=local, otherwise via ssh on the canon host.
+# Serialized with flock on STK_CANON_LOCK: parallel writes of index.jsonl
+# from several sessions would corrupt it.
+cmd_index() {
+    local PY
+    PY=$(cat <<'PY'
+import sys, os, json, glob, re, yaml
+root = sys.argv[1]
+out = os.path.join(root, "index.jsonl")
+fields = ["schema","session_id","node","project","project_path","git_branch","lang",
+          "name","name_source","class",
+          "status","status_source","dormancy_risk","tags","links","forked_from","distill_target","children",
+          "pilots","piloted_by","started_at","last_activity_at","last_indexed_at",
+          "last_indexed_uuid","n_events"]
+rows = []
+for md in glob.glob(os.path.join(root, "*", "*", "*.md")):
+    try:
+        txt = open(md, encoding="utf-8").read()
+        if not txt.startswith("---"):
+            continue
+        # the frontmatter ends at a delimiter LINE (same rule as helpers/config.py split_frontmatter;
+        # inline because this script runs on the canon host, where the helpers are not): a `---`
+        # inside a value is data
+        fm = re.split(r"(?m)^---[ \t]*$\n?", txt, maxsplit=2)[1]
+        data = yaml.safe_load(fm) or {}
+    except Exception as e:
+        sys.stderr.write(f"[stk index] skip {md}: {e}\n"); continue
+    rows.append({k: data.get(k) for k in fields if k in data})
+rows.sort(key=lambda r: str(r.get("last_activity_at") or ""), reverse=True)
+def _enc(o):
+    return o.isoformat() if hasattr(o, "isoformat") else str(o)
+with open(out, "w", encoding="utf-8") as fh:
+    for r in rows:
+        fh.write(json.dumps(r, ensure_ascii=False, default=_enc) + "\n")
+print(f"[stk] index.jsonl: {len(rows)} sessions -> {out}")
+PY
+)
+    _canon_check
+    local lock; lock=$(_lock_path)   # after the config checks: a relative canon_path is reported as such, not as its lock
+    if [[ "$STK_CANON_MODE" == local ]]; then
+        mkdir -p "$STK_CANON_PATH"
+        if command -v flock >/dev/null 2>&1; then
+            ( flock 9; printf '%s' "$PY" | uv run --no-project --with pyyaml --python 3.12 -q python - "$STK_CANON_PATH" ) 9>"$lock"
+        else
+            printf '%s' "$PY" | uv run --no-project --with pyyaml --python 3.12 -q python - "$STK_CANON_PATH"
+        fi
+    else
+        printf '%s' "$PY" | ssh "$STK_CANON_HOST" "flock $(_rq "$lock") uv run --no-project --with pyyaml --python 3.12 -q python - $(_rq "$STK_CANON_PATH")"
+    fi
+}
+
+# ---- subcommand: publish ----------------------------------------------------
+# End-of-block batch: shard -> canon (sync publish), reindex and, with canon_git=auto,
+# git commit of the canon subtree in the repository that hosts the canon. Not meant to
+# run at every close: it is launched at the end of a session/pass. Idempotent: if the
+# subtree did not change it creates no commit. Pushes by DEFAULT; --no-push for the
+# local commit on the canon only. With canon_git=off (the product default) it stops
+# after the index: no commit, no push.
+cmd_publish() {
+    # Push by default (see header): --no-push for the local commit only,
+    # --push is accepted as a synonym of the default.
+    local do_push=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --push) do_push=1; shift;;
+            --no-push) do_push=0; shift;;
+            *) die "publish: unknown flag '$1'";;
+        esac
+    done
+    cmd_sync publish
+    cmd_index
+    if [[ "$STK_CANON_GIT" == off ]]; then
+        echo "[stk] publish: canon_git=off, commit and push skipped"; return 0
+    fi
+    local day msg git_script
+    day=$(date -u +%Y-%m-%d)
+    msg="data(session-tracker): publish + reindex $day"
+    # Commit of the sessions subtree in the repo that contains the canon. Runs
+    # on-host with canon_mode=local, otherwise via ssh on the host.
+    git_script=$(cat <<'GIT'
+canon="$1"; msg="$2"; do_push="$3"
+root=$(git -C "$canon" rev-parse --show-toplevel 2>/dev/null) || {
+    echo "[stk] publish: $canon is not in a git repo, commit skipped"; exit 0; }
+# the lockfile lives in the canon: keep it out of the commits
+if [ ! -f "$canon/.gitignore" ] || ! grep -qxF '.stk.lock' "$canon/.gitignore" 2>/dev/null; then
+    echo '.stk.lock' >> "$canon/.gitignore"
+fi
+git -C "$root" add -- "$canon"
+if git -C "$root" diff --cached --quiet -- "$canon"; then
+    echo "[stk] publish: no changes to commit ($canon)"
+    # a push that failed on an earlier publish left commits behind: retry it now, or the canon's
+    # remote stays behind until a new commit happens to be made
+    if [ "$do_push" = 1 ] && git -C "$root" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 \
+       && [ "$(git -C "$root" rev-list --count '@{u}..HEAD')" -gt 0 ]; then
+        git -C "$root" push -q && echo "[stk] publish: push ok (commits an earlier push had left behind)" || { echo "[stk] publish: push FAILED" >&2; exit 1; }
+    fi
+elif git -C "$root" commit -q -m "$msg" -- "$canon"; then
+    echo "[stk] publish: commit '$msg' -> $root"
+    if [[ "$do_push" == 1 ]]; then
+        git -C "$root" push -q && echo "[stk] publish: push ok" || { echo "[stk] publish: push FAILED" >&2; exit 1; }
+    fi
+else
+    echo "[stk] publish: git commit FAILED" >&2
+    exit 1
+fi
+GIT
+)
+    local lock; lock=$(_lock_path)
+    if [[ "$STK_CANON_MODE" == local ]]; then
+        if command -v flock >/dev/null 2>&1; then
+            ( flock 9; bash -c "$git_script" _ "$STK_CANON_PATH" "$msg" "$do_push" ) 9>"$lock"
+        else
+            bash -c "$git_script" _ "$STK_CANON_PATH" "$msg" "$do_push"
+        fi
+    else
+        ssh "$STK_CANON_HOST" "flock $(_rq "$lock") bash -s -- $(_rq "$STK_CANON_PATH") $(printf '%q %q' "$msg" "$do_push")" <<<"$git_script"
+    fi
+}
+
+# ---- subcommand: dashboard --------------------------------------------------
+# Global live view of "what was left open", against the CURRENT state of the
+# canon (not the snapshot of sync pull): runs helpers/dashboard.py on the
+# canon if on-host (canon_mode=local), otherwise pipes the source via ssh.
+cmd_dashboard() {
+    local helpers; helpers=$(_helpers_dir)
+    _canon_check
+    if [[ "${1:-}" == "--triage" ]]; then
+        local troot="$STK_CANON_PATH"
+        [[ "$STK_CANON_MODE" == local ]] || troot="$STK_LOCAL/canon"
+        local hint="stk sync pull"; [[ "$STK_CANON_MODE" == local ]] && hint="stk index"
+        [[ -f "$troot/index.jsonl" ]] || die "dashboard --triage: $troot/index.jsonl is missing (run first: $hint)"
+        uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/triage.py" "$troot"
+        return
+    fi
+    if [[ "$STK_CANON_MODE" == local ]]; then
+        uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/dashboard.py" "$STK_CANON_PATH"
+    else
+        # remote stdout via ssh is not a tty: force the colour if WE are one HERE
+        local fc=""
+        if [[ -z "${NO_COLOR:-}" ]] && { [[ -t 1 ]] || [[ -n "${FORCE_COLOR:-}" ]]; }; then fc="FORCE_COLOR=1 "; fi
+        ssh "$STK_CANON_HOST" "${fc}uv run --no-project --with pyyaml --python 3.12 -q python - $(_rq "$STK_CANON_PATH")" < "$helpers/dashboard.py"
+    fi
+}
+
+# ---- subcommand: close ------------------------------------------------------
+# Explicitly closes a session (user override: status_source=user).
+# Updates the record (status/tags/links/summary) through the close.py helper via uv
+# (yaml-safe), then appends a status_change event. The pre-closure analysis
+# logic (leftover open items, multiple themes, missing info) is on the SKILL.md side
+# (Claude does it before invoking this command).
+_helpers_dir() {
+    local s
+    s=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
+    printf '%s/helpers' "$(dirname "$(dirname "$s")")"
+}
+# Closes ONE sid using the shared parameters (locals of cmd_close via dynamic
+# scoping): status/tags/links/summary/name/sclass/dtarget/force/rationale/node/
+# helpers/batch. In batch (>1 sid) the open-tab guard SKIPS the sid (warn) instead
+# of aborting; in single it keeps the hard stop. Returns 1 if it skips.
+_close_one() {
+    local sid="$1"
+    if [[ -z "$force" ]]; then
+        local _op; _op=$(_sid_open_pid "$sid") || true
+        if [[ -n "$_op" && "$sid" != "$(_resolve_current_sid 2>/dev/null)" ]]; then
+            if [[ "$batch" -eq 1 ]]; then
+                echo "[stk] close: SKIP $sid is OPEN (pid $_op); --force to close it anyway" >&2
+                return 1
+            fi
+            die "close: $sid is OPEN now (pid $_op). Close the tab first, or use --force to close the record anyway."
+        fi
+    fi
+
+    local encoded cwd
+    _resolve_encoded "$sid"; encoded="$RESOLVED_ENCODED"; cwd="$RESOLVED_CWD"
+    local md="$SHARD/$encoded/$sid.md"
+
+    # naming-guard-begin
+    # Guard on the name (helpers/naming.py check): subject from the cwd via naming-map,
+    # action from the closed set of references/naming.md, wip- reserved. Exit 1 =
+    # refusal (the line says which rule), 2 = guard not runnable. What follows is
+    # decided by naming_policy: error = no write in either case; warn = says it on
+    # stderr and writes, EXCEPT for a rejection the verdict marks `invariant` (wip-,
+    # characters outside the lexicon, empty name): those guard the record itself (a closed
+    # record named wip-... contradicts its status, a name with spaces breaks the single
+    # spelling of the index) and are refused with warn too, even when the map is declared
+    # but missing (the helper checks them before the map); off = does not call the guard.
+    # --force passes the conventions (subject, action), a guard that cannot run and an invalid
+    # naming_policy, never the invariants. tests/run.sh also proves it by MUTATION (copy of stk
+    # without this block, and one that ignores `invariant`): do not move the markers.
+    if [[ -n "$name" ]]; then
+        local pol="$STK_NAMING_POLICY"
+        if [[ -n "$force" && ! "$pol" =~ ^(off|warn|error)$ ]]; then
+            echo "[stk] close: invalid naming_policy '$pol' counts as warn (--force)" >&2; pol=warn
+        fi
+        [[ "$pol" != "$STK_NAMING_POLICY" ]] || _naming_policy_check
+        if [[ "$pol" == off ]]; then
+            echo "[stk] close: name '$name' not checked (naming_policy=off)" >&2
+        else
+            local verdict grc=0 errf
+            # The verdict is the JSON on stdout; stderr goes aside (a warning from python or uv
+            # there must not break the parse: with 2>&1 a ResourceWarning made jq fail, `invariant`
+            # read as false, and warn wrote a wip- name). stderr is shown only when the JSON is unusable.
+            # NB: not `if ! verdict=$(...); then grc=$?`: after `!` $? is the status of the `!`, always 0.
+            errf=$(mktemp); verdict=$(uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/naming.py" check \
+                    --cwd "${cwd:-}" --name "$name" --class "${sclass:-task}" \
+                    --naming-map "$STK_NAMING_MAP" ${STK_NAMING_MAP_DECLARED:+--require-map} 2>"$errf") && grc=0 || grc=$?
+            local vreason vrule vinvariant
+            vreason=$(jq -er '.reason' <<<"$verdict" 2>/dev/null) || vreason="$verdict $(tr '\n' ' ' <"$errf")"
+            rm -f "$errf"
+            vrule=$(jq -er '.rule' <<<"$verdict" 2>/dev/null) || vrule="?"
+            vinvariant=$(jq -r '.invariant // false' <<<"$verdict" 2>/dev/null) || vinvariant=false
+            case "$grc:$pol:$vinvariant:${force:-0}" in
+                0:*)         echo "[stk] close: name '$name' compliant ($vrule)" >&2;;
+                1:*:true:*)  die "close: --name '$name' refused: $vreason [rule: $vrule]. A record invariant, refused with naming_policy=warn and with --force too. Fix the name.";;
+                1:error:*:1) echo "[stk] close: --name '$name' NOT compliant: $vreason [rule: $vrule] (--force: accepted)" >&2;;
+                1:error:*:*) die "close: --name '$name' refused: $vreason [rule: $vrule]. Fix the name, or --force to pass.";;
+                1:*)         echo "[stk] close: --name '$name' NOT compliant: $vreason [rule: $vrule] (naming_policy=warn: accepted)" >&2;;
+                *:error:*:1) echo "[stk] close: naming guard not runnable (exit $grc): $vreason (--force: name not checked)" >&2;;
+                *:error:*:*) die "close: naming guard not runnable (exit $grc): $vreason";;
+                *)           echo "[stk] close: naming guard not runnable (exit $grc): $vreason (naming_policy=warn: name not checked)" >&2;;
+            esac
+        fi
+    fi
+    # naming-guard-end
+    mkdir -p "$SHARD/$encoded"
+
+    local args=("$md" --status "$status" --session "$sid" --node "$node" --project-path "${cwd:-}")
+    if [[ ${#tags[@]} -gt 0 ]];  then for t in "${tags[@]}";  do args+=(--add-tag "$t");  done; fi
+    if [[ ${#links[@]} -gt 0 ]]; then for l in "${links[@]}"; do args+=(--add-link "$l"); done; fi
+    [[ -n "$summary" ]] && args+=(--summary "$summary")
+    [[ -n "$name" ]] && args+=(--name "$name")
+    [[ -n "$sclass" ]] && args+=(--class "$sclass")
+    [[ -n "$dtarget" ]] && args+=(--distill-target "$dtarget")
+
+    local result
+    result=$(uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/close.py" "${args[@]}") || die "close: helper failed ($sid)"
+
+    local prev_status; prev_status=$(jq -r '.prev_status // "unknown"' <<<"$result")
+    local ts; ts=$(iso_now)
+    jq -nc --arg ts "$ts" --arg node "$node" --arg sid "$sid" \
+           --arg from "$prev_status" --arg to "$status" --arg rat "$rationale" '
+        {ts:$ts, node:$node, event:"status_change", session_id:$sid, from:$from, to:$to, by:"user"}
+        + (if $rat=="" then {} else {rationale:$rat} end)
+    ' >> "$SHARD/events.jsonl"
+
+    echo "[stk] close: $sid ($prev_status -> $status)"
+    echo "$result"
+}
+cmd_close() {
+    local status="done" rationale="" summary="" name="" sclass="" dtarget="" force=""
+    local sids=() tags=() links=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --current)    local _cur; _cur=$(_resolve_current_sid) || die "close: cannot identify the current session (no \$CLAUDE_CODE_SESSION_ID and no PID match in ~/.claude/sessions); use --session <id>"; sids+=("$_cur"); shift;;
+            --session)    require_arg "${2:-}" --session; sids+=("$2"); shift 2;;
+            --status)     require_arg "${2:-}" --status; status="$2"; shift 2;;
+            --add-tag)    require_arg "${2:-}" --add-tag; tags+=("$2"); shift 2;;
+            --add-link)   require_arg "${2:-}" --add-link; links+=("$2"); shift 2;;
+            --summary)    require_arg "${2:-}" --summary; summary="$2"; shift 2;;
+            --name)       require_arg "${2:-}" --name; name="$2"; shift 2;;
+            --class)      require_arg "${2:-}" --class; sclass="$2"; shift 2;;
+            --distill-target) require_arg "${2:-}" --distill-target; dtarget="$2"; shift 2;;
+            --rationale)  require_arg "${2:-}" --rationale; rationale="$2"; shift 2;;
+            --force)      force=1; shift;;
+            *) die "close: unknown flag '$1'";;
+        esac
+    done
+    [[ "$status" =~ ^(done|dropped|superseded|branched)$ ]] || die "close: invalid status '$status' (done|dropped|superseded|branched)"
+    [[ -z "$sclass" || "$sclass" =~ ^(task|distill)$ ]] || die "close: invalid class '$sclass' (task|distill)"
+    [[ ${#sids[@]} -gt 0 ]] || die "close: no session specified (use --current or --session <id>)"
+    _paths_check   # a relative path in config stops the close before any write
+
+    # batch (>1 sid): the PER-SESSION fields make no sense shared across several sids
+    local batch=0
+    if [[ ${#sids[@]} -gt 1 ]]; then
+        batch=1
+        [[ -z "$name$sclass$dtarget$summary" ]] || die "close: --name/--class/--distill-target/--summary are per-session, not usable with several --session (batch); use only --status/--add-tag/--add-link/--rationale"
+    fi
+
+    local node; node=$(resolve_node)
+    local helpers; helpers=$(_helpers_dir)
+    local sid rc=0
+    for sid in "${sids[@]}"; do
+        _close_one "$sid" || rc=1
+    done
+    return "$rc"
+}
+
+# ---- subcommand: branch -----------------------------------------------------
+# Branching of a session (/branch, /fork, /rewind). Two sides:
+#   - default (TRUNK, before /branch): checkpoint of the trunk at status=branched
+#     + name (via close.py, non-terminal user override), then prints the commands
+#     to run by hand (/rename of the trunk, /branch <child>). /branch is a
+#     slash command of the TUI: it cannot be run from here.
+#   - --register (CHILD, 1st turn after /branch): reads forkedFrom from the FIELD of its
+#     own transcript (jq, NEVER grep: the transcript may contain "forkedFrom"
+#     as text) and writes the light stub (authoritative forked_from + name from the
+#     custom-title, status auto) via stub.py. No-op if it is not a branch. The reciprocal
+#     children and the global index materialize at the next publish.
+cmd_branch() {
+    _paths_check   # no write with a relative path in config
+    local register=0 sid="" name="" child=""
+    local tags=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --register)  register=1; shift;;
+            --current)   sid=$(_resolve_current_sid) || die "branch: cannot identify the current session (no \$CLAUDE_CODE_SESSION_ID and no PID match); use --session <id>"; shift;;
+            --session)   require_arg "${2:-}" --session; sid="$2"; shift 2;;
+            --name)      require_arg "${2:-}" --name; name="$2"; shift 2;;
+            --child)     require_arg "${2:-}" --child; child="$2"; shift 2;;
+            --add-tag)   require_arg "${2:-}" --add-tag; tags+=("$2"); shift 2;;
+            *) die "branch: unknown flag '$1'";;
+        esac
+    done
+    [[ -n "$sid" ]] || die "branch: no session specified (use --current or --session <id>)"
+
+    local node; node=$(resolve_node)
+    local f encoded cwd
+    f=$(ls "$CLAUDE_DIR"/projects/*/"$sid".jsonl 2>/dev/null | head -1) || true
+    if [[ -n "$f" ]]; then
+        encoded=$(basename "$(dirname "$f")")
+        cwd=$(jq -rn 'reduce inputs as $e (null; if $e.cwd!=null then $e.cwd else . end)' "$f" 2>/dev/null)
+    else
+        encoded="_unindexed"; cwd=""
+    fi
+    local md="$SHARD/$encoded/$sid.md"
+    mkdir -p "$SHARD/$encoded"
+    local helpers; helpers=$(_helpers_dir)
+
+    if [[ "$register" -eq 1 ]]; then
+        # CHILD side: the parent comes from the forkedFrom FIELD (no grep)
+        [[ -n "$f" ]] || die "branch --register: transcript not found for $sid"
+        local parent title
+        parent=$(jq -rn 'first(inputs | select(.forkedFrom != null) | .forkedFrom.sessionId)' "$f" 2>/dev/null || true)
+        if [[ -z "$parent" || "$parent" == "null" ]]; then
+            echo "[stk] branch --register: $sid is not a branch (no forkedFrom), nothing to register"
+            return 0
+        fi
+        title=$(jq -rn 'last(inputs | select(.type=="custom-title" and .customTitle!=null) | .customTitle) // empty' "$f" 2>/dev/null || true)
+        local args=("$md" --session "$sid" --node "$node" --project-path "${cwd:-}" --forked-from "$parent")
+        [[ -n "$title" ]] && args+=(--name "$title")
+        local result
+        result=$(uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/stub.py" "${args[@]}") || die "branch --register: stub.py failed"
+        echo "[stk] branch --register: $sid <- forked_from $node:$parent"
+        echo "$result"
+        return 0
+    fi
+
+    # TRUNK side: checkpoint at status=branched
+    local cargs=("$md" --status branched --session "$sid" --node "$node" --project-path "${cwd:-}")
+    [[ -n "$name" ]] && cargs+=(--name "$name")
+    if [[ ${#tags[@]} -gt 0 ]]; then for t in "${tags[@]}"; do cargs+=(--add-tag "$t"); done; fi
+    local result
+    result=$(uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/close.py" "${cargs[@]}") || die "branch: trunk checkpoint failed"
+    local prev_status; prev_status=$(jq -r '.prev_status // "unknown"' <<<"$result")
+    local ts; ts=$(iso_now)
+    jq -nc --arg ts "$ts" --arg node "$node" --arg sid "$sid" --arg from "$prev_status" '
+        {ts:$ts, node:$node, event:"status_change", session_id:$sid, from:$from, to:"branched", by:"user"}
+    ' >> "$SHARD/events.jsonl"
+    echo "[stk] branch: trunk $sid checkpoint -> branched ($prev_status -> branched)"
+    echo "$result"
+    echo
+    echo "Now, IN THE TRUNK, run by hand:"
+    [[ -n "$name" ]] && echo "  /rename $name"
+    echo "  /branch ${child:-<child-name>}"
+    echo "Once in the child, register the link with: stk branch --register --current"
+}
+
+# ---- subcommand: where ------------------------------------------------------
+# Deterministic placement (READ-ONLY, no network): computes the "home" of the
+# session's subject (ownership block > read-only prose > cluster emerging
+# from index.jsonl) and compares it with where-you-are (node + folder). Reads the
+# local index (the store with canon_mode=local, the mirror $STK_LOCAL/canon/index.jsonl with ssh),
+# the naming map and the CLAUDE.md/CLAUDE.local.md
+# in the cwd's tree; does NOT pull (best-effort: stale mirror -> low confidence).
+# Emits JSON with verdict (here|elsewhere|unknown) + candidates with evidence and
+# score; the POLICY (whether or not to propose cd/ssh/branch) is Claude's (see SKILL.md +
+# references/placement.md). The mechanics live in helpers/where.py.
+cmd_where() {
+    local sid="" cwd="" node_ovr="" intent="" forked="" human="" idx="" nmap=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --current)     sid=$(_resolve_current_sid) || die "where: cannot identify the current session (no \$CLAUDE_CODE_SESSION_ID and no PID match); use --session <id> or --cwd/--node"; shift;;
+            --session)     require_arg "${2:-}" --session; sid="$2"; shift 2;;
+            --cwd)         require_arg "${2:-}" --cwd; cwd="$2"; shift 2;;
+            --node)        require_arg "${2:-}" --node; node_ovr="$2"; shift 2;;
+            --intent)      require_arg "${2:-}" --intent; intent="$2"; shift 2;;
+            --forked-from) require_arg "${2:-}" --forked-from; forked="$2"; shift 2;;
+            --index)       require_arg "${2:-}" --index; idx="$2"; shift 2;;
+            --naming-map)  require_arg "${2:-}" --naming-map; nmap="$2"; shift 2;;
+            --human)       human="--human"; shift;;
+            *) die "where: unknown flag '$1'";;
+        esac
+    done
+    _paths_check   # a relative data_dir or naming_map would be read from the current folder
+
+    local node; node="${node_ovr:-$(resolve_node)}"
+    # With a session, fill the gaps (cwd/forked/intent) from the transcript + shard.
+    if [[ -n "$sid" ]]; then
+        local f; f=$(ls "$CLAUDE_DIR"/projects/*/"$sid".jsonl 2>/dev/null | head -1) || true
+        if [[ -n "$f" ]]; then
+            [[ -z "$cwd" ]] && cwd=$(jq -rn 'reduce inputs as $e (null; if $e.cwd!=null then $e.cwd else . end)' "$f" 2>/dev/null)
+            if [[ -z "$forked" ]]; then
+                forked=$(jq -rn 'first(inputs | select(.forkedFrom != null) | .forkedFrom.sessionId)' "$f" 2>/dev/null || true)
+                [[ "$forked" == "null" ]] && forked=""
+            fi
+        fi
+        if [[ -z "$intent" && -f "$SHARD/events.jsonl" ]]; then
+            intent=$(jq -r --arg s "$sid" 'select(.session_id==$s and .event=="note" and .kind=="intent") | .text' "$SHARD/events.jsonl" 2>/dev/null | tail -1) || intent=""
+        fi
+    fi
+    [[ -n "$cwd" ]] || die "where: cwd not determined (pass --cwd, or --current/--session with a valid transcript)"
+
+    # with canon_mode=local the canon IS the local store, and canon/ is only the mirror that
+    # `sync pull` fills one round behind (empty after `sync both`): read the store's index, as
+    # `dashboard --triage` does. With ssh the mirror is the only local copy.
+    if [[ -z "$idx" ]]; then
+        if [[ "$STK_CANON_MODE" == local ]]; then idx="$STK_CANON_PATH/index.jsonl"; else idx="$STK_LOCAL/canon/index.jsonl"; fi
+    fi
+    [[ -n "$nmap" ]] || nmap="$STK_NAMING_MAP"
+
+    local helpers; helpers=$(_helpers_dir)
+    # a map declared in config but missing is an error (same rule as close and the hook), not
+    # a missing map: where.py reports naming_map_error and exits 2; the explicit --naming-map is
+    # the caller's and is taken as is.
+    local reqmap=""
+    [[ -n "$STK_NAMING_MAP_DECLARED" && "$nmap" == "$STK_NAMING_MAP" ]] && reqmap="--require-map"
+    uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/where.py" \
+        --node "$node" --cwd "$cwd" --session "${sid:-}" \
+        --forked-from "${forked:-}" --intent "${intent:-}" \
+        --index "$idx" --naming-map "$nmap" $reqmap $human
+}
+
+# ---- subcommand: repo-status -------------------------------------------------
+# One-shot git state of a local path (pure bash, no python/uv). NO
+# `git fetch`: it reads the state/remote-tracking ref as it is (no network
+# side effect, even when it runs via `-u` on a remote node). "dirty"/"ahead" are
+# what matters to detect work not yet seen by the secondary; "behind"
+# may be stale if nobody fetched recently (that is not the point here: for
+# a check against an up-to-date origin is the job of the tool that syncs the repo). Errors as structured JSON,
+# never die: the caller (often via ssh) must be able to tell them apart.
+cmd_repo_status() {
+    local path="${1:-}"
+    [[ -n "$path" ]] || die "repo-status: path required"
+    if [[ ! -d "$path" ]]; then
+        jq -nc --arg p "$path" '{path:$p, error:"path-not-found"}'; return 0
+    fi
+    if ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        jq -nc --arg p "$path" '{path:$p, error:"not-a-git-repo"}'; return 0
+    fi
+    local branch dirty up ahead=0 behind=0 has_up=false ab
+    branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    dirty=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    up=$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || up=""
+    if [[ -n "$up" ]]; then
+        has_up=true
+        ab=$(git -C "$path" rev-list --left-right --count "$up"...HEAD 2>/dev/null || echo "0 0")
+        behind=$(awk '{print $1}' <<<"$ab"); ahead=$(awk '{print $2}' <<<"$ab")
+    fi
+    jq -nc --arg p "$path" --arg b "$branch" --argjson d "$dirty" \
+        --argjson hu "$has_up" --argjson a "${ahead:-0}" --argjson bh "${behind:-0}" \
+        '{path:$p, branch:$b, dirty:$d, has_upstream:$hu, ahead:$a, behind:$bh}'
+}
+
+# ---- subcommand: primary-check ------------------------------------------------
+# Extends `where`: if the ownership is declared with a primary different from the
+# current node, compares the local state (ALWAYS live, never cached: it is the
+# most important signal, e.g. a file edited by mistake on a secondary node) with
+# that of the primary via ssh (remote repo-status, behind a cache of STK_PRIMARY_
+# CHECK_TTL seconds: the remote side is the only costly/networked one). USES THE NETWORK,
+# unlike `where`, which is declaredly read-only/no-network: that is why it
+# stays a separate subcommand instead of being stuffed inside cmd_where.
+_primary_check_cache_key() {
+    printf '%s:%s' "$1" "$2" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+cmd_primary_check() {
+    _paths_check   # the cache lives under data_dir, no write with a relative path
+    local where_args=() human=0 force=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --current) where_args+=(--current); shift;;
+            --session) require_arg "${2:-}" --session; where_args+=(--session "$2"); shift 2;;
+            --cwd)     require_arg "${2:-}" --cwd; where_args+=(--cwd "$2"); shift 2;;
+            --node)    require_arg "${2:-}" --node; where_args+=(--node "$2"); shift 2;;
+            --human)   human=1; shift;;
+            --force)   force=1; shift;;
+            *) die "primary-check: unknown flag '$1'";;
+        esac
+    done
+
+    # cmd_where calls die() (=exit) internally on invalid input: it must ALWAYS be
+    # invoked inside $(...) (subshell fork), never as a direct statement, or one of
+    # its die() would kill the whole stk process instead of being intercepted.
+    local where_json
+    where_json=$(cmd_where "${where_args[@]}" 2>/dev/null) || { jq -nc '{applicable:false,error:"where-failed"}'; return 0; }
+
+    local node cwd declared primary_node primary_path
+    node=$(jq -r '.current.node' <<<"$where_json")
+    cwd=$(jq -r '.current.cwd' <<<"$where_json")
+    declared=$(jq -r '.current.ownership.declared' <<<"$where_json")
+    primary_node=$(jq -r '.current.ownership.primary_node // empty' <<<"$where_json")
+    primary_path=$(jq -r '.current.ownership.primary_path // empty' <<<"$where_json")
+
+    if [[ "$declared" != "true" || -z "$primary_node" || "$primary_node" == "$node" ]]; then
+        jq -nc '{applicable:false}'; return 0
+    fi
+
+    # local: always live, never cached
+    local toplevel local_json
+    toplevel=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || toplevel=""
+    if [[ -n "$toplevel" ]]; then local_json=$(cmd_repo_status "$toplevel")
+    else local_json='{"error":"local-not-a-repo"}'; fi
+
+    # remote: behind cache/TTL
+    mkdir -p "$STK_LOCAL/primary-check"
+    local key cache ttl now cts=0 remote_json=""
+    key=$(_primary_check_cache_key "$primary_node" "$primary_path")
+    cache="$STK_LOCAL/primary-check/$key.json"
+    ttl="${STK_PRIMARY_CHECK_TTL:-1800}"
+    now=$(now_epoch)
+    [[ -f "$cache" ]] && cts=$(jq -r '.ts_epoch // 0' "$cache" 2>/dev/null || echo 0)
+
+    if [[ "$force" -eq 0 && -f "$cache" && $((now - cts)) -lt "$ttl" ]]; then
+        remote_json=$(jq -c '.remote' "$cache")
+    else
+        local tcmd=""
+        command -v timeout  >/dev/null 2>&1 && tcmd="timeout 6"
+        [[ -z "$tcmd" ]] && command -v gtimeout >/dev/null 2>&1 && tcmd="gtimeout 6"
+        remote_json=$($tcmd "$0" -u "$primary_node" repo-status "$primary_path" 2>/dev/null) || true
+        if [[ -z "$remote_json" ]] || ! jq -e . >/dev/null 2>&1 <<<"$remote_json"; then
+            remote_json=$(jq -nc --arg n "$primary_node" '{error:"unreachable", node:$n}')
+        fi
+        jq -nc --arg ts "$(iso_now)" --argjson tse "$now" --arg pn "$primary_node" --arg pp "$primary_path" \
+            --argjson rem "$remote_json" \
+            '{ts:$ts, ts_epoch:$tse, primary_node:$pn, primary_path:$pp, remote:$rem}' \
+            > "$cache.tmp.$$" && mv -f "$cache.tmp.$$" "$cache"
+    fi
+
+    local issues related out
+    issues=$(jq -nc --argjson loc "$local_json" --argjson rem "$remote_json" '
+        [ (if ($loc.dirty // 0) > 0 then "local-dirty" else empty end),
+          (if $rem.error == "unreachable" then "primary-unreachable" else empty end),
+          (if ($rem.dirty // 0) > 0 then "primary-dirty" else empty end),
+          (if ($rem.ahead // 0) > 0 then "primary-ahead" else empty end) ]')
+    related=$(jq -c '[.candidates[]?.related_sessions[]?] | unique_by(.session_id)' <<<"$where_json")
+
+    out=$(jq -nc --argjson own "$(jq -c '.current.ownership' <<<"$where_json")" \
+        --argjson loc "$local_json" --argjson rem "$remote_json" \
+        --argjson iss "$issues" --argjson rel "$related" \
+        '{applicable:true, ownership:$own, local:$loc, remote:$rem, issues:$iss, related_sessions:$rel}')
+
+    if [[ "$human" -eq 1 ]]; then _render_primary_check_human "$out"; else printf '%s\n' "$out"; fi
+}
+
+_render_primary_check_human() {
+    local j="$1" applicable
+    applicable=$(jq -r '.applicable' <<<"$j")
+    if [[ "$applicable" != "true" ]]; then
+        echo "primary-check: not applicable (the current node is already the primary, or ownership not declared)."
+        return 0
+    fi
+    local pn pp ld pd rd pa ru
+    pn=$(jq -r '.ownership.primary_node' <<<"$j")
+    pp=$(jq -r '.ownership.primary_path' <<<"$j")
+    ld=$(jq -r '.local.dirty // "?"' <<<"$j")
+    rd=$(jq -r '.remote.dirty // "?"' <<<"$j")
+    pa=$(jq -r '.remote.ahead // "?"' <<<"$j")
+    ru=$(jq -e '.issues | index("primary-unreachable")' <<<"$j" >/dev/null 2>&1 && echo 1 || echo 0)
+
+    echo "primary-check: current node vs primary ${pn} (${pp})"
+    if [[ "$ru" == "1" ]]; then
+        echo "  primary unreachable via ssh (network/alias down, or repo/path missing on the primary)."
+    else
+        echo "  primary: dirty=${rd} ahead=${pa}"
+    fi
+    echo "  local:   dirty=${ld}"
+
+    local issues_n; issues_n=$(jq -r '.issues | length' <<<"$j")
+    if [[ "$issues_n" -eq 0 ]]; then
+        echo "  ok: aligned."
+        return 0
+    fi
+    echo "  issues: $(jq -r '.issues | join(", ")' <<<"$j")"
+    local rel; rel=$(jq -r '.related_sessions[]? | "    - " + .node + " / " + (.name // "(unnamed)") + " [" + .status + "]"' <<<"$j")
+    if [[ -n "$rel" ]]; then
+        echo "  related sessions (to understand where to resume):"
+        printf '%s\n' "$rel"
+    fi
+}
+
+# ---- subcommand: hygiene ----------------------------------------------------
+# Cleans up the EMPTY STUBS of the local shard (orphan records without information:
+# status unknown/auto, empty name, null forked_from, empty extracted+user_notes).
+# Default dry-run (lists); --apply removes. Local shard only: the canon is
+# git-versioned. See helpers/hygiene.py for the criteria.
+cmd_hygiene() {
+    _paths_check   # no write with a relative path in config
+    local apply=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply) apply="--apply"; shift;;
+            *) die "hygiene: unknown flag '$1'";;
+        esac
+    done
+    local helpers; helpers=$(_helpers_dir)
+    uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/hygiene.py" --shard "$SHARD" $apply
+}
+
+# ---- subcommand: hook -------------------------------------------------------
+# SessionStart entry (schema confirmed with the Claude Code docs: JSON payload on
+# stdin with fields session_id|cwd|source|hook_event_name|transcript_path; output
+# {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":...}}).
+# Only at source startup|resume|clear and with no intent already recorded it emits
+# additionalContext, composed of the clauses turned on in config (hook_*, naming_policy,
+# hook_extra_context_file): by default all off except the name proposal (warn) and,
+# at resume/clear, the branch registration. Without clauses it emits nothing.
+# Logs every invocation in $STK_LOCAL/hook.log for diagnostics.
+cmd_hook() {
+    local payload sid source decision="" degraded="" log="$STK_LOCAL/hook.log"
+    # with a relative data_dir the hook creates nothing in the current folder: the log goes to stderr
+    if [[ "$STK_LOCAL" == /* ]]; then mkdir -p "$STK_LOCAL"; else log=/dev/stderr; fi
+    payload=$(cat || true)
+    sid=$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null) || sid=""
+    source=$(jq -r '.source // empty' <<<"$payload" 2>/dev/null) || source=""
+    # Injects at startup (new session), resume (/branch,/fork,/rewind or a real
+    # resume) and clear (/clear = new logical session). Skips compact and the others.
+    if [[ ! "$source" =~ ^(startup|resume|clear)$ ]]; then
+        decision="skip:source=${source:-empty}"
+        printf '%s\t%s\t%s\t%s\n' "$(iso_now)" "${sid:-?}" "${source:-?}" "$decision" >>"$log"
+        exit 0
+    fi
+    if [[ -z "$sid" ]]; then
+        decision="skip:no-sid"
+        printf '%s\t%s\t%s\t%s\n' "$(iso_now)" "?" "$source" "$decision" >>"$log"
+        exit 0
+    fi
+    # the shard is read only if data_dir is absolute: a relative path would be a file of the cwd
+    if [[ "$STK_LOCAL" == /* && -f "$SHARD/events.jsonl" ]] && \
+       jq -e --arg s "$sid" 'select(.session_id==$s and .event=="note" and .kind=="intent")' \
+            "$SHARD/events.jsonl" >/dev/null 2>&1; then
+        # the intent is there, but a session resumed after /branch, /fork or /rewind may still
+        # have its trunk to register: that clause alone goes out, the others are done with
+        if [[ "$source" =~ ^(resume|clear)$ ]]; then
+            printf '%s\t%s\t%s\tinject:%s:branch-only\n' "$(iso_now)" "${sid:0:8}" "$source" "$source" >>"$log"
+            jq -nc --arg c "If this session was born from /branch, /fork or /rewind, register the link with the trunk by running: stk branch --register --current (no-op if it is not a branch)." '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'
+            exit 0
+        fi
+        decision="skip:intent-exists"
+        printf '%s\t%s\t%s\t%s\n' "$(iso_now)" "${sid:0:8}" "$source" "$decision" >>"$log"
+        exit 0
+    fi
+    # Every clause is opt-in from the config (hook_*), except the branch one, which is core.
+    # _hook_on <key> <value>: on|off; any other value counts as off and ends up in the log, so
+    # a typo does not turn a clause off silently (stk doctor will say it again).
+    _hook_on() { case "$2" in on) return 0;; off) return 1;;
+        *) printf '%s\t%s\t%s\twarn:%s=%s invalid (on|off), counts as off\n' "$(iso_now)" "${sid:0:8}" "$source" "$1" "$2" >>"$log"; return 1;; esac; }
+    local policy="$STK_NAMING_POLICY"
+    if [[ ! "$policy" =~ ^(off|warn|error)$ ]]; then
+        printf '%s\t%s\t%s\twarn:naming_policy=%s invalid (off|warn|error), counts as warn\n' "$(iso_now)" "${sid:0:8}" "$source" "$policy" >>"$log"
+        policy=warn
+    fi
+    # a relative path in config does not stop the hook: the log says it, and it says it in the context, because
+    # with a relative data_dir the log goes to stderr, which the registered hook discards. Those paths are not read.
+    local perr cfgerr=""
+    while IFS= read -r perr; do
+        [[ -n "$perr" ]] || continue
+        printf '%s\t%s\t%s\twarn:%s\n' "$(iso_now)" "${sid:0:8}" "$source" "${perr%% (file*}" >>"$log"
+        cfgerr="${cfgerr:+$cfgerr; }${perr%% (file*}"
+    done < <(_paths_errors)
+    local ctx=""
+    [[ -z "$cfgerr" ]] || ctx="Invalid session-tracker config ($STK_CONFIG_FILE): $cfgerr. Fix it, stk doctor lists it; until then those paths are not read."
+    # evaluated once: the placement clause reuses the answer, so a bad value is logged once
+    local ask_on=0; _hook_on hook_ask_intent "$STK_HOOK_ASK_INTENT" && ask_on=1
+    if [[ $ask_on -eq 1 ]]; then
+        ctx="$ctx No intent recorded for this session of the session-tracker. As the FIRST turn, ask the user for the goal of the session in one sentence, then record it by running: stk note --session ${sid} --kind intent \"<goal>\". Do not repeat the question if the user ignores it."
+    fi
+    # Proposal of the canonical name (naming_policy warn|error): fires on EVERY fresh session
+    # (startup included), not only on the branches at resume/clear. Same gate as the intent. As soon as
+    # the theme is clear, it proposes /rename wip-<name>: the `wip-` marker says the session
+    # is not closed and falls away at close.
+    if [[ "$policy" != off ]]; then
+        ctx="$ctx If the session title is not yet canonical (auto-generated by the harness, contains the tag <command-, ends with \" (Branch)\", or does not follow references/naming.md of the session-tracker skill), as soon as the theme of the session is clear derive the canonical name from the content and propose that the user run /rename wip-<name> (Claude cannot run it by itself). The wip- marker says the session is still running: it falls away at closure, where /rename <name> is proposed and the same value WITHOUT wip- is passed to stk close --name. If the title is already compliant, propose nothing."
+        # Naming context resolved from the cwd (helpers/naming.py): the contexts row
+        # that applies to this folder, with its comment, and the set of actions. The
+        # model does not have to remember the map: the rule reaches it already applied, and
+        # the text still asks it to read the two files and cite the row. If the
+        # helper fails (uv missing, network), the hook injects the rest anyway.
+        # The same call decides on the tmux window (hook_tmux_tab=on, only inside tmux):
+        # helpers/naming.py window_text. An empty $TMUX_PANE must be excluded: `-t ""` answers with
+        # another window.
+        local cwd nctx="" winfo=""
+        local -a wargs=()
+        if [[ -n "${TMUX_PANE:-}" ]] && _hook_on hook_tmux_tab "$STK_HOOK_TMUX_TAB"; then
+            winfo=$(tmux display-message -p -t "$TMUX_PANE" '#{automatic-rename} #{window_name}' 2>/dev/null) || winfo=""
+            [[ -n "$winfo" ]] && wargs=("--window-auto=${winfo%% *}" "--window-name=${winfo#* }")
+        fi
+        cwd=$(jq -r '.cwd // empty' <<<"$payload" 2>/dev/null) || cwd=""
+        [[ -n "$cwd" ]] || cwd="$PWD"
+        # a relative naming_map is not read: it would be a file of the cwd mistaken for a map
+        # (the config error above already says so). When the helper cannot run (no uv in the
+        # hook's PATH, a crash) the hook still injects the rest, but it says so: in the log
+        # (`inject:<source> degraded:...`) and in the text, so the model does not propose a
+        # name as if the map had been consulted.
+        if [[ "$STK_NAMING_MAP" == /* ]]; then
+            if command -v uv >/dev/null 2>&1; then
+                local nrc=0
+                nctx=$(uv run --no-project --with pyyaml --python 3.12 -q python "$(_helpers_dir)/naming.py" context \
+                        --cwd "$cwd" --naming-map "$STK_NAMING_MAP" ${STK_NAMING_MAP_DECLARED:+--require-map} \
+                        --policy "$policy" --text ${wargs[@]+"${wargs[@]}"} 2>/dev/null) || nrc=$?
+                [[ $nrc -eq 0 && -n "$nctx" ]] || { nctx=""; degraded="naming-context:helper-rc=$nrc"; }
+            else
+                degraded="naming-context:no-uv"
+            fi
+        fi
+        [[ -n "$nctx" ]] && ctx="$ctx $nctx"
+        [[ -z "$degraded" ]] || ctx="$ctx Naming context NOT resolved for this cwd: the helper did not run (${degraded#naming-context:}), so the naming map was not consulted. Apply only the generic rules of references/naming.md of the session-tracker skill and say that the map was not read."
+    fi
+    # Placement: after the intent, check whether the session is in the right place.
+    # stk where computes the candidates (deterministic); the proposal is made by Claude
+    # only if verdict=elsewhere with sufficient confidence (anti-nag).
+    if _hook_on hook_placement "$STK_HOOK_PLACEMENT"; then
+        # the reference to the intent only makes sense if the intent clause is there
+        local when="Assess the placement: run"
+        [[ $ask_on -eq 1 ]] && when="Then assess the placement: after recording the intent run"
+        ctx="$ctx $when stk where --current (read-only, reads the local index, no network). If it reports verdict=elsewhere with confidence medium or high, propose to the user where it is better to continue (cd <path> on the same node; ssh <node> + cd on another node; or, if the related ones include a live trunk, resume that session and /branch instead of starting from scratch). If verdict is here or unknown, propose nothing. See references/placement.md of the session-tracker skill."
+    fi
+    if _hook_on hook_primary_check "$STK_HOOK_PRIMARY_CHECK"; then
+        ctx="$ctx If stk where --current (read-only, reads the local index) reports a declared ownership with a primary different from this node (current.ownership.primary_node != current.node), consider also running stk primary-check --current --human (it makes an ssh call to the primary, 30-min cache on the remote side: do not repeat it several times in the same session). If applicable is false or the command fails, say nothing. If issues is not empty, tell the user what does not add up (uncommitted local changes on this secondary node, or the primary with uncommitted/unpushed changes) and use related_sessions to suggest the node/canonical session/folder where to possibly resume, instead of proceeding blindly from here. See references/primary-check.md of the session-tracker skill."
+    fi
+    if [[ "$source" =~ ^(resume|clear)$ ]]; then
+        ctx="$ctx Finally, if this session was born from /branch, /fork or /rewind, register the link with the trunk by running: stk branch --register --current (no-op if it is not a branch)."
+    fi
+    # Overlay: the text of hook_extra_context_file at the end, as it is. A declared but
+    # unreadable file does not stop the rest: the log says it.
+    # A relative path is not read: it would be a file of the repo being worked in (the log above says it).
+    if [[ -n "$STK_HOOK_EXTRA_CONTEXT_FILE" && "$STK_HOOK_EXTRA_CONTEXT_FILE" == /* ]]; then
+        local extra
+        if extra=$(cat "$STK_HOOK_EXTRA_CONTEXT_FILE" 2>/dev/null); then
+            [[ -n "${extra//[[:space:]]/}" ]] && ctx="$ctx $extra"
+        else
+            printf '%s\t%s\t%s\twarn:hook_extra_context_file=%s unreadable\n' "$(iso_now)" "${sid:0:8}" "$source" "$STK_HOOK_EXTRA_CONTEXT_FILE" >>"$log"
+        fi
+    fi
+    ctx="${ctx# }"
+    if [[ -z "${ctx//[[:space:]]/}" ]]; then
+        decision="skip:nothing-to-inject"
+        printf '%s\t%s\t%s\t%s\n' "$(iso_now)" "${sid:0:8}" "$source" "$decision" >>"$log"
+        exit 0
+    fi
+    jq -nc --arg c "$ctx" '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'
+    decision="inject:${source}${degraded:+ degraded:$degraded}"
+    printf '%s\t%s\t%s\t%s\n' "$(iso_now)" "${sid:0:8}" "$source" "$decision" >>"$log"
+}
+
+# ---- subcommand: init -------------------------------------------------------
+# Writes the config file. Non-interactive: the choices come from the flags, the other keys
+# stay commented out with their default and a line saying what they are for, so the file is
+# also the documentation of how to change or turn something off (naming included).
+# The same rule on paths and the same value domain as _canon_check apply.
+cmd_init() {
+    local node="" mode="" host="" path="" cgit="" policy="" force=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --node)          require_arg "${2:-}" --node; node="$2"; shift 2;;
+            --canon-mode)    require_arg "${2:-}" --canon-mode; mode="$2"; shift 2;;
+            --canon-host)    require_arg "${2:-}" --canon-host; host="$2"; shift 2;;
+            --canon-path)    require_arg "${2:-}" --canon-path; path="$2"; shift 2;;
+            --canon-git)     require_arg "${2:-}" --canon-git; cgit="$2"; shift 2;;
+            --naming-policy) require_arg "${2:-}" --naming-policy; policy="$2"; shift 2;;
+            --force)         force=1; shift;;
+            *) die "init: unknown flag '$1'";;
+        esac
+    done
+    [[ -z "$mode"   || "$mode"   =~ ^(local|ssh)$ ]]      || die "init: invalid canon_mode '$mode' (local|ssh)"
+    [[ -z "$cgit"   || "$cgit"   =~ ^(auto|off)$ ]]       || die "init: invalid canon_git '$cgit' (auto|off)"
+    [[ -z "$policy" || "$policy" =~ ^(off|warn|error)$ ]] || die "init: invalid naming_policy '$policy' (off|warn|error)"
+    local v
+    for v in "$node" "$mode" "$host" "$path" "$cgit" "$policy"; do
+        [[ "$v" != *$'\n'* ]] || die "init: a value with a newline would write extra lines in the config file"
+    done
+    [[ -z "$node" ]] || printf '%s' "$node" | LC_ALL=C grep -qE '^[a-z0-9][a-z0-9_.-]*$' || die "init: node '$node' is not a slug (lowercase, [a-z0-9_.-])"
+    if [[ "$mode" == ssh ]]; then
+        [[ -n "$host" && -n "$path" ]] || die "init: canon_mode=ssh requires --canon-host and --canon-path (the path on the host)"
+    elif [[ -n "$path" && "$path" != /* && "$path" != "~/"* ]]; then
+        die "init: relative canon_path '$path': config paths are absolute or start with ~/"
+    fi
+    [[ -n "$force" || ! -e "$STK_CONFIG_FILE" ]] || die "init: $STK_CONFIG_FILE already exists; --force to overwrite it"
+    mkdir -p "$(dirname "$STK_CONFIG_FILE")"
+    # kv <key> <value> <default> <what it is for>: active line if the value is there, otherwise commented out with the default
+    kv() { printf '# %s\n' "$4"; if [[ -n "$2" ]]; then printf '%s = %s\n\n' "$1" "$2"; else printf '# %s = %s\n\n' "$1" "$3"; fi; }
+    {
+        printf '# session-tracker: node config, written by `stk init`. `key = value` lines; `#` at the start of a\n'
+        printf '# line comments it out. Precedence: STK_* variable > this file > default. A commented-out key takes\n'
+        printf '# the default written next to it. Check: `stk doctor`.\n\n'
+        kv node "$node" "<node file in data_dir, then hostname>" "slug of the node (the machine name often is not one)"
+        kv data_dir "" "~/.local/session-tracker" "local staging and mirror; absolute path or with ~/"
+        kv canon_mode "$mode" local "local: canon on-host; ssh: on canon_host (this key alone decides)"
+        kv canon_host "$host" "<empty>" "ssh host of the canon (required with canon_mode=ssh)"
+        kv canon_path "$path" "<data_dir>/store" "path of the canon; with ssh it is the path on the host and must be declared"
+        kv canon_git "$cgit" off "off: publish does not touch git; auto: commit and push if the canon is in a git repo"
+        kv known_nodes "" "<empty>" "slugs of the known nodes, for where (commas or spaces)"
+        kv remote_aliases "" "<empty>" "ssh aliases allowed as pilot (merge)"
+        kv pilot_commands "" "<empty>" "remote piloting commands whose -u <alias> scan reads as a pilot candidate"
+        kv naming_policy "$policy" warn "off: no name proposal or check; warn: the hook proposes, close reports and accepts (wip- and the lexicon refused anyway); error: close refuses (--force passes, except those two)"
+        kv naming_map "" "<data_dir>/naming-map.yaml" "map of the subjects per folder (references/naming.md); sync pull copies it here from the canon"
+        kv hook_ask_intent "" off "the hook asks for the session goal at the first turn (on|off)"
+        kv hook_placement "" off "the hook has the placement assessed with stk where (on|off)"
+        kv hook_primary_check "" off "the hook has stk primary-check assessed where the primary is another node (on|off)"
+        kv hook_tmux_tab "" off "the hook proposes the name of the tmux window (on|off; requires naming_policy != off)"
+        kv hook_extra_context_file "" "<empty>" "file whose text the hook appends to its own (overlay); absolute path or with ~/"
+    } > "$STK_CONFIG_FILE"
+    echo "[stk] init: config written to $STK_CONFIG_FILE (commented-out keys take the default). Check: stk doctor"
+}
+
+# ---- subcommand: doctor -----------------------------------------------------
+# Diagnosis of the config and of the node, in helpers/doctor.py (it reads the config with config.py, which
+# has the list of the keys: that is where an unknown key is recognized). No network,
+# except --remote (command -v stk via ssh on the configured aliases).
+cmd_doctor() {
+    local remote=""
+    case "${1:-}" in "") ;; --remote) remote=--remote; shift;; *) die "doctor: unknown argument '$1' (only --remote)";; esac
+    [[ $# -eq 0 ]] || die "doctor: no other argument expected"
+    command -v uv >/dev/null 2>&1 || die "doctor: uv missing (the helpers run with uv run)"
+    local helpers; helpers=$(_helpers_dir)
+    # doctor.py rereads the config by itself: it only gets the STK_* that were in the environment,
+    # not the ones resolved and exported above (otherwise every key would look like it came from the env and
+    # naming_map would always be declared)
+    local v; local -a scrub=()
+    for v in $(compgen -A variable STK_); do
+        case " $STK_ENV_KEYS " in *" $v "*) ;; *) scrub+=(-u "$v");; esac
+    done
+    env ${scrub[@]+"${scrub[@]}"} uv run --no-project --with pyyaml --python 3.12 -q python "$helpers/doctor.py" --settings "$CLAUDE_DIR/settings.json" --plugins-dir "$PLUGINS_DIR" $remote
+}
+
+# ---- subcommand: shim -------------------------------------------------------
+# The plugin's bin/ is in the PATH of Claude Code's Bash shell alone, and the installation
+# path carries the version: a symlink would break at every update. The shim
+# (shim/stk) resolves the current installation at every call, and it is what an ssh shell
+# (`stk -u`, primary-check) and the terminal find in PATH. `resolve` runs the same
+# resolution as the installed file and prints the chosen bin/stk.
+cmd_shim() {
+    local sub="${1:-}"; shift || true
+    local root; root=$(dirname "$(_helpers_dir)")
+    local tpl="$root/shim/stk"
+    [[ -f "$tpl" ]] || die "shim: template missing ($tpl)"
+    case "$sub" in
+        resolve)
+            [[ $# -eq 0 ]] || die "shim resolve: no argument expected"
+            bash "$tpl" --stk-shim-resolve;;
+        install)
+            local dest="$HOME/.local/bin/stk" force=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --dest)  require_arg "${2:-}" --dest; dest="$2"; shift 2;;
+                    --force) force=1; shift;;
+                    *) die "shim install: unknown flag '$1'";;
+                esac
+            done
+            [[ "$dest" == /* || "$dest" == "~/"* ]] || die "shim install: --dest wants an absolute path or with ~/ ('$dest')"
+            [[ "$dest" == "~/"* ]] && dest="$HOME/${dest#\~/}"
+            [[ -d "$dest" ]] && die "shim install: $dest is a directory"
+            # what is already there: its own shim (line 2 = marker) or a symlink to a session-tracker
+            # bin/stk (line 2 of the target = stk header; another program of the same name
+            # linked into bin/ is a name collision) get replaced; any other file
+            # is someone else's and asks for --force
+            if [[ -e "$dest" || -L "$dest" ]]; then
+                local what="" real
+                if [[ -L "$dest" ]]; then
+                    real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$dest")
+                    [[ "$real" == */bin/stk && "$(sed -n 2p "$real" 2>/dev/null)" == "# stk "* ]] && what="symlink"
+                elif [[ -f "$dest" ]] && sed -n 2p "$dest" | grep -q '^# session-tracker shim'; then
+                    what="shim"
+                fi
+                if [[ -z "$what" && -z "$force" ]]; then
+                    die "shim install: $dest exists and is neither a session-tracker shim nor a symlink to one of its bin/stk: --force to replace it"
+                fi
+                # before removing a working symlink: the shim must resolve something WITHOUT
+                # counting what is in the folder of $dest (STK_SHIM_SKIP_DIR, compared by real
+                # path: removing the folder from the PATH was circumvented with a trailing slash and also removed
+                # a python3 that happened to be there), otherwise outside Claude stk goes from
+                # working to exit 127 (node without the plugin, or session with --plugin-dir). Its own
+                # shim is always replaced: if it resolved nothing it did not work before either.
+                if [[ -z "$force" && "$what" != shim ]] && ! STK_SHIM_SKIP_DIR="$(dirname "$dest")" bash "$tpl" --stk-shim-resolve >/dev/null; then
+                    die "shim install: $dest is there and works, but here the shim would resolve no installation (no record in $PLUGINS_DIR, no STK_PLUGIN_ROOT, no other stk in PATH): install the plugin first, or --force"
+                fi
+                # rm before writing: no implementation of install must write through the link
+                rm -f -- "$dest"
+                echo "[stk] shim: replaced ${what:-the previous file} in $dest" >&2
+            fi
+            mkdir -p "$(dirname "$dest")"
+            install -m 755 "$tpl" "$dest"
+            echo "[stk] shim: written $dest"
+            local target
+            if target=$(bash "$dest" --stk-shim-resolve); then
+                echo "[stk] shim: here it resolves $target"
+            else
+                echo "[stk] shim: here it resolves no installation (no record in $PLUGINS_DIR, no STK_PLUGIN_ROOT, no other stk in PATH): outside Claude 'stk' will fail until the plugin is installed; check: stk doctor" >&2
+            fi
+            case ":$PATH:" in
+                *":$(dirname "$dest"):"*) ;;
+                *) echo "[stk] shim: $(dirname "$dest") is not in the PATH of this shell: add it, or 'stk' will not be found from the terminal" >&2;;
+            esac;;
+        *) die "shim: usage: stk shim (install [--dest <path>] [--force] | resolve)";;
+    esac
+}
+
+# ---- dispatch ---------------------------------------------------------------
+REMOTE_USER=""
+while [[ "${1:-}" =~ ^- ]]; do
+    case "$1" in
+        -u|--user) require_arg "${2:-}" "$1"; REMOTE_USER="$2"; shift 2;;
+        -h|--help) usage;;
+        --) shift; break;;
+        *) die "unknown global flag '$1'";;
+    esac
+done
+
+cmd="${1:-}"; [[ -z "$cmd" ]] && usage; shift || true
+
+# -u <alias>: runs the subcommand on the remote node via ssh. Open tab, resumability
+# and the shard are LOCAL concepts of the node: they run there (e.g. `dashboard --triage`
+# detects the live tabs of THAT node; `close` respects its open-tab guard).
+# Allowlist: scan|close|note|publish|dashboard|repo-status. primary-check is
+# deliberately excluded (see comment at the top of the file): it would use -u to
+# check the primary of ANOTHER remote node, a pointless double hop.
+# Safe quoting of the arguments with %q (holds spaces/special characters in --summary/--name
+# through ssh). ConnectTimeout/BatchMode avoid hangs on a down network or password/passphrase
+# prompts.
+if [[ -n "$REMOTE_USER" ]]; then
+    case "$cmd" in
+        scan|close|note|publish|dashboard|repo-status) ;;
+        *) die "-u/--user supported only with: scan close note publish dashboard repo-status (not '$cmd')";;
+    esac
+    # colour: the remote stdout via ssh is not a tty, so we propagate FORCE_COLOR
+    # if we are on a tty HERE (or FORCE_COLOR is already set) and NO_COLOR does not forbid it.
+    # That way `stk -u <node> dashboard --triage` is coloured; the others ignore the var.
+    fc=""
+    if [[ -z "${NO_COLOR:-}" ]] && { [[ -t 1 ]] || [[ -n "${FORCE_COLOR:-}" ]]; }; then fc="FORCE_COLOR=1 "; fi
+    # the alias doubles as the remote node's slug (STK_NODE) inside the command string: the
+    # slug lexicon keeps it one word, so an alias cannot carry a second command
+    [[ "$REMOTE_USER" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || die "-u: '$REMOTE_USER' is not a node slug ([a-z0-9][a-z0-9_.-]*): the alias is also the remote node's slug (STK_NODE there). Declare the destination as an ssh config alias with a slug name (Host <slug>, HostName, User) and pass that"
+    remote_args=$(printf '%q ' "$cmd" "$@")
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_USER" "${fc}STK_NODE=$(printf %q "$REMOTE_USER") stk $remote_args"
+    exit $?
+fi
+
+case "$cmd" in
+    scan)  cmd_scan "$@";;
+    note)  cmd_note "$@";;
+    link)  cmd_link "$@";;
+    sync)  cmd_sync "$@";;
+    index) cmd_index "$@";;
+    publish) cmd_publish "$@";;
+    dashboard) cmd_dashboard "$@";;
+    where) cmd_where "$@";;
+    repo-status) cmd_repo_status "$@";;
+    primary-check) cmd_primary_check "$@";;
+    close) cmd_close "$@";;
+    branch) cmd_branch "$@";;
+    hygiene) cmd_hygiene "$@";;
+    hook)  cmd_hook "$@";;
+    init)  cmd_init "$@";;
+    doctor) cmd_doctor "$@";;
+    shim)  cmd_shim "$@";;
+    *) die "unknown command '$cmd'";;
+esac

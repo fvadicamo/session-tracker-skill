@@ -1,0 +1,8 @@
+{
+  "name": "session-tracker",
+  "version": "1.0.0",
+  "description": "Map, classify and navigate Claude Code sessions across nodes: open, dormant or closed, with intent, notes and a motivated closure. Ships the stk dispatcher and a SessionStart hook.",
+  "author": { "name": "Francesco Vadicamo" },
+  "license": "MIT",
+  "keywords": ["sessions", "session-tracker", "multi-node", "hooks"]
+}

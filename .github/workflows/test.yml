@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Install the tools the README lists (macOS ships bash 3.2 and no flock)
+        if: runner.os == 'macOS'
+        run: brew install bash flock jq
+      - name: Run deterministic tests
+        run: |
+          export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+          bash tests/run.sh
+      - name: Run the suite again with the system bash 3.2 first in PATH (macOS without Homebrew's bash)
+        if: runner.os == 'macOS'
+        run: |
+          D=$(mktemp -d); ln -s /bin/bash "$D/bash"
+          export PATH="$D:$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+          bash --version | head -1
+          bash tests/run.sh
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code
+        run: curl -fsSL https://claude.ai/install.sh | bash
+      - name: Validate the plugin manifest
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          claude plugin validate .
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
